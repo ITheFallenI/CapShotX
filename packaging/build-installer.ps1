@@ -107,15 +107,18 @@ try {
 
     if ($CommitAndPush) {
         Write-Host "Committing and pushing $tag to GitHub..." -ForegroundColor Cyan
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
         & git add -A
-        if ($LASTEXITCODE -ne 0) { throw "git add failed" }
+        if ($LASTEXITCODE -ne 0) { $ErrorActionPreference = $prevEap; throw "git add failed" }
         $status = & git status --porcelain
         if (-not [string]::IsNullOrWhiteSpace(($status -join ""))) {
             & git commit -m "Release $tag"
-            if ($LASTEXITCODE -ne 0) { throw "git commit failed" }
+            if ($LASTEXITCODE -ne 0) { $ErrorActionPreference = $prevEap; throw "git commit failed" }
         }
         & git push origin main
-        if ($LASTEXITCODE -ne 0) { throw "git push failed" }
+        if ($LASTEXITCODE -ne 0) { $ErrorActionPreference = $prevEap; throw "git push failed" }
+        $ErrorActionPreference = $prevEap
     }
 
     if ($PublishRelease) {
@@ -123,10 +126,14 @@ try {
         $portableAsset = "$distPortable#CapShotX.exe (Portable)"
 
         Write-Host "Publishing $tag to GitHub Releases..." -ForegroundColor Cyan
-        & gh release view $tag > $null 2>&1
-        if ($LASTEXITCODE -eq 0) {
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        & gh release view $tag *> $null
+        $releaseExists = ($LASTEXITCODE -eq 0)
+
+        if ($releaseExists) {
             & gh release upload $tag $setupAsset $portableAsset --clobber
-            if ($LASTEXITCODE -ne 0) { throw "Failed to upload release assets to $tag" }
+            if ($LASTEXITCODE -ne 0) { $ErrorActionPreference = $prevEap; throw "Failed to upload release assets to $tag" }
             Write-Host "Updated assets on existing release $tag!" -ForegroundColor Green
         } else {
             if ([string]::IsNullOrWhiteSpace($ReleaseNotes)) {
@@ -134,9 +141,10 @@ try {
             } else {
                 & gh release create $tag $setupAsset $portableAsset --title "CapShotX $tag" --notes $ReleaseNotes
             }
-            if ($LASTEXITCODE -ne 0) { throw "Failed to create GitHub release $tag" }
+            if ($LASTEXITCODE -ne 0) { $ErrorActionPreference = $prevEap; throw "Failed to create GitHub release $tag" }
             Write-Host "Published new GitHub release $tag!" -ForegroundColor Green
         }
+        $ErrorActionPreference = $prevEap
     }
 } finally {
     if ($BumpMinor -and -not $buildSucceeded -and $null -ne $originalCargoToml) {
