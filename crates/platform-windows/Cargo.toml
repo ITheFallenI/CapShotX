@@ -20,6 +20,7 @@ windows = { workspace = true, features = [
     "Win32_Media_Audio",
     "Win32_Media_KernelStreaming",
     "Win32_Media_Multimedia",
+    "Win32_Networking_WinHttp",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_System_Com",

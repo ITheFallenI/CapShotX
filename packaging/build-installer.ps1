@@ -1,5 +1,7 @@
 param(
-    [switch]$Offline
+    [switch]$Offline,
+    [switch]$PublishRelease,
+    [string]$ReleaseNotes = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -66,6 +68,34 @@ try {
     Write-Host "[3/3] Packaging complete!" -ForegroundColor Green
     Write-Host "  Installer : $distSetup ($setupMb MB)"
     Write-Host "  Portable  : $distPortable ($appMb MB)"
+
+    if ($PublishRelease) {
+        $cargoToml = Get-Content (Join-Path $RepoRoot "Cargo.toml") -Raw
+        if ($cargoToml -match '(?m)^version\s*=\s*"([^"]+)"') {
+            $ver = $Matches[1]
+        } else {
+            throw "Could not parse version from Cargo.toml"
+        }
+        $tag = "v$ver"
+        $setupAsset = "$distSetup#CapShotX-Setup.exe (Windows Installer)"
+        $portableAsset = "$distPortable#CapShotX.exe (Portable)"
+
+        Write-Host "Publishing $tag to GitHub Releases..." -ForegroundColor Cyan
+        & gh release view $tag > $null 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            & gh release upload $tag $setupAsset $portableAsset --clobber
+            if ($LASTEXITCODE -ne 0) { throw "Failed to upload release assets to $tag" }
+            Write-Host "Updated assets on existing release $tag!" -ForegroundColor Green
+        } else {
+            if ([string]::IsNullOrWhiteSpace($ReleaseNotes)) {
+                & gh release create $tag $setupAsset $portableAsset --title "CapShotX $tag" --generate-notes
+            } else {
+                & gh release create $tag $setupAsset $portableAsset --title "CapShotX $tag" --notes $ReleaseNotes
+            }
+            if ($LASTEXITCODE -ne 0) { throw "Failed to create GitHub release $tag" }
+            Write-Host "Published new GitHub release $tag!" -ForegroundColor Green
+        }
+    }
 } finally {
     Remove-Item Env:\CAPSHOTX_PAYLOAD_EXE -ErrorAction SilentlyContinue
     Pop-Location

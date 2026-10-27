@@ -118,6 +118,11 @@ pub enum AppCommand {
     RecordingStarted(Result<crate::screen_record::Active, String>),
     RecordingFinished(Result<recorder::Summary, String>),
     RecoveredRecordings(Vec<std::path::PathBuf>),
+    UpdateCheckFinished {
+        result: Result<Option<platform_windows::updater::ReleaseInfo>, String>,
+        manual: bool,
+    },
+    UpdateInstallFinished(Result<(), String>),
 }
 
 /// Sends [`AppCommand`]s and wakes whichever loop is currently active on the

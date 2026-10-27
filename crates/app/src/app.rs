@@ -74,6 +74,17 @@ struct Recording {
     key_capture: KeyCapture,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) enum UpdateState {
+    #[default]
+    Idle,
+    Checking,
+    UpToDate,
+    Available(platform_windows::updater::ReleaseInfo),
+    Downloading(platform_windows::updater::ReleaseInfo),
+    Error(String),
+}
+
 /// Persistent lightweight process state (~a few KB) that lives across UI
 /// sessions while CapShotX sits in the tray with zero GPU/renderer overhead.
 pub struct CoreState {
@@ -86,6 +97,7 @@ pub struct CoreState {
     last_saved_folder: Option<std::path::PathBuf>,
     pub(crate) page: Page,
     pub(crate) settings_tab: SettingsTab,
+    pub(crate) update_state: UpdateState,
     pub window_size: [f32; 2],
     pub window_pos_px: Option<[f32; 2]>,
     pub window_maximized: bool,
@@ -107,6 +119,7 @@ impl CoreState {
         instance: SingleInstance,
         sync_startup_enabled: bool,
     ) -> anyhow::Result<Self> {
+        platform_windows::updater::cleanup_old_exe();
         let (tx, commands) = mpsc::channel();
         let waker = Waker::new(
             tx,
@@ -156,6 +169,7 @@ impl CoreState {
                 });
         }
 
+        let check_on_startup = settings.check_updates_on_startup;
         let mut core = Self {
             saved_settings: settings.clone(),
             settings,
@@ -166,6 +180,7 @@ impl CoreState {
             last_saved_folder: None,
             page: Page::Home,
             settings_tab: SettingsTab::General,
+            update_state: UpdateState::Idle,
             window_size: [1040.0, 680.0],
             window_pos_px: None,
             window_maximized: false,
@@ -183,7 +198,64 @@ impl CoreState {
             core.apply_shortcut(action);
         }
         core.sync_startup();
+        if check_on_startup {
+            core.check_for_updates(false);
+        }
         Ok(core)
+    }
+
+    pub fn check_for_updates(&mut self, manual: bool) {
+        if matches!(self.update_state, UpdateState::Checking | UpdateState::Downloading(_)) {
+            return;
+        }
+        self.update_state = UpdateState::Checking;
+        let waker = self.waker.clone();
+        let _ = std::thread::Builder::new()
+            .name("update-check".into())
+            .spawn(move || {
+                let result =
+                    platform_windows::updater::check_for_update(env!("CARGO_PKG_VERSION"));
+                waker.send(AppCommand::UpdateCheckFinished { result, manual });
+            });
+    }
+
+    pub fn install_update(&mut self, release: platform_windows::updater::ReleaseInfo) {
+        if matches!(self.update_state, UpdateState::Downloading(_)) {
+            return;
+        }
+        self.persist_settings_headless();
+        self.update_state = UpdateState::Downloading(release.clone());
+        let waker = self.waker.clone();
+        let _ = std::thread::Builder::new()
+            .name("update-install".into())
+            .spawn(move || {
+                let res = platform_windows::updater::download_and_install_update(&release);
+                waker.send(AppCommand::UpdateInstallFinished(res));
+            });
+    }
+
+    fn on_update_check_finished(
+        &mut self,
+        result: Result<Option<platform_windows::updater::ReleaseInfo>, String>,
+        manual: bool,
+    ) {
+        match result {
+            Ok(Some(info)) => {
+                tracing::info!("update available on GitHub: v{}", info.version);
+                self.update_state = UpdateState::Available(info);
+            }
+            Ok(None) => {
+                self.update_state = UpdateState::UpToDate;
+            }
+            Err(err) => {
+                tracing::debug!("update check failed (manual={manual}): {err}");
+                if manual {
+                    self.update_state = UpdateState::Error(err);
+                } else {
+                    self.update_state = UpdateState::Idle;
+                }
+            }
+        }
     }
 
     fn sync_startup(&mut self) {
@@ -309,6 +381,17 @@ impl CoreState {
                         return TrayStep::OpenWindow;
                     }
                     self.trim_if_idle();
+                }
+                AppCommand::UpdateCheckFinished { result, manual } => {
+                    self.on_update_check_finished(result, manual);
+                    self.trim_if_idle();
+                }
+                AppCommand::UpdateInstallFinished(Ok(())) => {
+                    return TrayStep::Quit;
+                }
+                AppCommand::UpdateInstallFinished(Err(err)) => {
+                    tracing::warn!("update install failed: {err}");
+                    self.update_state = UpdateState::Error(err);
                 }
             }
         }
@@ -724,8 +807,42 @@ impl<'a> CapShotApp<'a> {
         }
     }
 
-    fn tray_status(&self, ui: &mut Ui) {
+    fn tray_status(&mut self, ui: &mut Ui) {
         let p = palette(ui);
+        if let UpdateState::Available(info) = &self.core.update_state {
+            let ver = info.version.clone();
+            let clicked = ui
+                .scope_builder(UiBuilder::new().sense(Sense::click()), |ui| {
+                    let hovered = ui.response().hovered();
+                    Frame::new()
+                        .fill(if hovered { p.control_hover } else { p.accent_soft })
+                        .stroke(Stroke::new(1.0, p.accent))
+                        .corner_radius(10)
+                        .inner_margin(Margin::symmetric(12, 10))
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.label(
+                                RichText::new(format!("Update v{ver} available"))
+                                    .font(semibold(12.5))
+                                    .color(p.accent),
+                            );
+                            ui.label(
+                                RichText::new("Click to view & install")
+                                    .size(11.5)
+                                    .color(p.muted),
+                            );
+                        });
+                })
+                .response
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked();
+            if clicked {
+                self.stop_recording();
+                self.core.page = Page::Settings;
+                self.core.settings_tab = SettingsTab::About;
+            }
+            ui.add_space(8.0);
+        }
         widgets::card(ui, |ui| {
             ui.horizontal(|ui| {
                 let (dot, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
@@ -1016,6 +1133,11 @@ impl<'a> CapShotApp<'a> {
                 widgets::section_label(ui, "Displays");
                 widgets::card(ui, |ui| self.displays_card(ui));
             }
+            if Self::updates_matches(&query) {
+                space_section(ui, &mut any_section);
+                widgets::section_label(ui, "Updates");
+                widgets::card(ui, |ui| self.updates_card(ui));
+            }
             if Self::about_card_matches(&query) {
                 space_section(ui, &mut any_section);
                 widgets::section_label(ui, "About");
@@ -1032,7 +1154,7 @@ impl<'a> CapShotApp<'a> {
                         .color(p.text),
                 );
                 ui.label(
-                    RichText::new("Try searching for hotkey, tray, admin, folder, audio, fps, or theme.")
+                    RichText::new("Try searching for hotkey, update, tray, admin, folder, audio, fps, or theme.")
                         .size(12.5)
                         .color(p.muted),
                 );
@@ -1041,7 +1163,7 @@ impl<'a> CapShotApp<'a> {
     }
 
     fn window_tray_matches(q: &str) -> bool {
-        const H: &str = "general window tray close button hide to tray quit tray left-click open app latest capture folder gallery settings launch at windows startup sign in autostart start hidden low memory mode standard windows menu capture admin windows administrator elevated task manager uac";
+        const H: &str = "general window tray close button hide to tray quit tray left-click open app latest capture folder gallery settings launch at windows startup sign in autostart start hidden low memory mode standard windows menu capture admin windows administrator elevated task manager uac automatic update checks github releases";
         q.is_empty() || H.contains(q)
     }
 
@@ -1080,13 +1202,18 @@ impl<'a> CapShotApp<'a> {
         q.is_empty() || H.contains(q)
     }
 
+    fn updates_matches(q: &str) -> bool {
+        const H: &str = "updates automatic update check upgrade version github release download install";
+        q.is_empty() || H.contains(q)
+    }
+
     fn about_card_matches(q: &str) -> bool {
         const H: &str = "about version logs folder settings json config path";
         q.is_empty() || H.contains(q)
     }
 
     fn about_matches(q: &str) -> bool {
-        Self::displays_matches(q) || Self::about_card_matches(q)
+        Self::displays_matches(q) || Self::updates_matches(q) || Self::about_card_matches(q)
     }
 
     fn window_tray_card(&mut self, ui: &mut Ui, q: &str) {
@@ -1102,6 +1229,7 @@ impl<'a> CapShotApp<'a> {
 
         let mut restart_admin = false;
         let mut toggled_admin_on = false;
+        let mut trigger_update_check = false;
         {
             let is_elevated = self.core.is_elevated;
             let recording_busy = self.core.screen.is_busy();
@@ -1170,6 +1298,21 @@ impl<'a> CapShotApp<'a> {
                         },
                     );
                 }
+                if show("automatic update checks github releases startup version") {
+                    sep(ui, &mut any);
+                    widgets::setting_row(
+                        ui,
+                        "Automatic update checks",
+                        "Check GitHub Releases for new CapShotX versions when starting up",
+                        |ui| {
+                            if widgets::toggle(ui, &mut s.check_updates_on_startup).changed()
+                                && s.check_updates_on_startup
+                            {
+                                trigger_update_check = true;
+                            }
+                        },
+                    );
+                }
                 if show("capture admin windows administrator elevated task manager uac permissions") {
                     sep(ui, &mut any);
                     let admin_desc = if s.run_as_admin && !is_elevated {
@@ -1198,6 +1341,9 @@ impl<'a> CapShotApp<'a> {
                 }
             });
         }
+        if trigger_update_check {
+            self.core.check_for_updates(false);
+        }
         if restart_admin {
             self.core.persist_settings_headless();
             if platform_windows::shell::relaunch_as_admin(&["--wait-restart", "--open-settings"]).is_ok() {
@@ -1209,6 +1355,120 @@ impl<'a> CapShotApp<'a> {
                 self.core.settings.run_as_admin = false;
                 self.core.persist_settings_headless();
             }
+        }
+    }
+
+    fn updates_card(&mut self, ui: &mut Ui) {
+        let p = palette(ui);
+        let current = env!("CARGO_PKG_VERSION");
+        let recording_busy = self.core.screen.is_busy();
+        let state = self.core.update_state.clone();
+
+        let (title, subtitle, sub_color) = match &state {
+            UpdateState::Idle => (
+                format!("Installed version: v{current}"),
+                "Updates are downloaded directly from GitHub Releases and verified with SHA-256.".to_owned(),
+                p.muted,
+            ),
+            UpdateState::Checking => (
+                "Checking for updates…".to_owned(),
+                format!("Querying github.com/{}/releases", platform_windows::updater::GITHUB_REPO),
+                p.accent,
+            ),
+            UpdateState::UpToDate => (
+                format!("You're up to date (v{current})"),
+                "CapShotX is running the latest release on GitHub.".to_owned(),
+                p.success,
+            ),
+            UpdateState::Available(info) => {
+                let mb = info.exe_size as f64 / (1024.0 * 1024.0);
+                let size_str = if mb > 0.1 {
+                    format!(" ({mb:.1} MB)")
+                } else {
+                    String::new()
+                };
+                (
+                    format!("CapShotX v{} is available{size_str}", info.version),
+                    "Click Update & Restart to download, verify SHA-256, and upgrade in place.".to_owned(),
+                    p.accent,
+                )
+            }
+            UpdateState::Downloading(info) => (
+                format!("Downloading & installing CapShotX v{}…", info.version),
+                "Verifying SHA-256 digest and replacing executable — CapShotX will restart automatically.".to_owned(),
+                p.accent,
+            ),
+            UpdateState::Error(err) => (
+                "Update check or install failed".to_owned(),
+                err.clone(),
+                p.danger,
+            ),
+        };
+
+        let mut do_check = false;
+        let mut do_install = None;
+        let mut open_url = None;
+
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.label(RichText::new(title).size(14.5).color(p.text));
+                ui.label(RichText::new(subtitle).size(12.5).color(sub_color));
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                match &state {
+                    UpdateState::Available(info) => {
+                        if ui
+                            .add_enabled(!recording_busy, egui::Button::new("Update & Restart"))
+                            .on_disabled_hover_text("Stop the active screen recording before updating")
+                            .clicked()
+                        {
+                            do_install = Some(info.clone());
+                        }
+                        if ui.button("Release notes").clicked() {
+                            open_url = Some(info.html_url.clone());
+                        }
+                    }
+                    UpdateState::Checking | UpdateState::Downloading(_) => {
+                        ui.add_enabled(false, egui::Button::new("Working…"));
+                    }
+                    UpdateState::Idle | UpdateState::UpToDate | UpdateState::Error(_) => {
+                        if ui.button("Check for updates").clicked() {
+                            do_check = true;
+                        }
+                        if ui.button("GitHub Releases").clicked() {
+                            open_url = Some(format!(
+                                "https://github.com/{}/releases",
+                                platform_windows::updater::GITHUB_REPO
+                            ));
+                        }
+                    }
+                }
+            });
+        });
+
+        ui.separator();
+        widgets::setting_row(
+            ui,
+            "Check for updates at startup",
+            "Automatically check GitHub Releases in the background when CapShotX starts",
+            |ui| {
+                if widgets::toggle(ui, &mut self.core.settings.check_updates_on_startup).changed()
+                    && self.core.settings.check_updates_on_startup
+                {
+                    do_check = true;
+                }
+            },
+        );
+
+        if do_check {
+            self.core.check_for_updates(true);
+        }
+        if let Some(info) = do_install {
+            self.core.install_update(info);
+        }
+        if let Some(url) = open_url {
+            platform_windows::shell::open(std::path::Path::new(&url));
         }
     }
 
@@ -1557,6 +1817,17 @@ impl eframe::App for CapShotApp<'_> {
                 AppCommand::Hotkey(action) => self.run_action(ctx, action),
                 AppCommand::CaptureFinished { finished, restore_window } => {
                     self.on_capture_finished(ctx, finished, restore_window);
+                }
+                AppCommand::UpdateCheckFinished { result, manual } => {
+                    self.core.on_update_check_finished(result, manual);
+                }
+                AppCommand::UpdateInstallFinished(Ok(())) => {
+                    self.exit = UiExit::Quit;
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                }
+                AppCommand::UpdateInstallFinished(Err(err)) => {
+                    tracing::warn!("update install failed: {err}");
+                    self.core.update_state = UpdateState::Error(err);
                 }
             }
         }

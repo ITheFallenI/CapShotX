@@ -21,3 +21,4 @@ pub mod single_instance;
 pub mod sound;
 pub mod startup;
 pub mod toast;
+pub mod updater;

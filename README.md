@@ -71,6 +71,9 @@ Grab the latest build from [**GitHub Releases**](https://github.com/ITheFallenI/
   microphone, or a disconnected headset.
 
 ### System tray, Low memory mode & Settings
+- **Built-in GitHub auto-updater** — checks GitHub Releases in the background on
+  startup (toggleable in Settings) and lets you download, verify (SHA-256), and install
+  updates in place with one click (**Update & Restart**), with no UAC prompt required.
 - **Low memory mode (on by default)** — destroys the main window and GPU swapchain
   while minimised to the system tray (`--minimized`) and trims the working set to
   ~0.1–2 MB until reopened.
@@ -117,6 +120,9 @@ target\release\CapShotX.exe
 
 # Build the standalone installer + portable bundle into dist\
 .\packaging\build-installer.ps1
+
+# Build and publish/update the GitHub Release in one step
+.\packaging\build-installer.ps1 -PublishRelease
 ```
 
 Run the tests with `cargo test --workspace`. `cargo run -p recorder --example record_check`
@@ -142,7 +148,7 @@ and the full product specification is in [`Documentation/`](Documentation/).
 
 1. ~~Screenshot capture + gallery~~ ✅
 2. ~~Screen recording with audio~~ ✅
-3. ~~Native Windows installer & uninstaller~~ ✅
+3. ~~Native Windows installer, uninstaller & GitHub auto-updater~~ ✅
 4. **Image editor**: layers, annotations, redaction, adjustments ← next
 5. Video studio: timeline editing, smooth zoom, cursor effects, callouts
 
@@ -157,8 +163,9 @@ and the full product specification is in [`Documentation/`](Documentation/).
 
 ## Privacy
 
-CapShotX makes no network connections. Captures, recordings, settings and thumbnails all
-stay on your machine.
+Captures, recordings, settings and thumbnails all stay on your machine. No telemetry or
+analytics are collected; the only optional network request is checking GitHub Releases for
+updates (which can be disabled in **Settings**).
 
 ## License
 

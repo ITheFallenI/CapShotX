@@ -218,6 +218,7 @@ pub struct Settings {
     pub start_hidden: bool,
     pub low_memory_mode: bool,
     pub run_as_admin: bool,
+    pub check_updates_on_startup: bool,
     /// Overrides of default shortcuts; an empty string disables the shortcut.
     pub shortcuts: BTreeMap<Action, String>,
     pub capture: CaptureSettings,
@@ -234,6 +235,7 @@ impl Default for Settings {
             start_hidden: false,
             low_memory_mode: true,
             run_as_admin: false,
+            check_updates_on_startup: true,
             shortcuts: BTreeMap::new(),
             capture: CaptureSettings::default(),
             record: RecordSettings::default(),
