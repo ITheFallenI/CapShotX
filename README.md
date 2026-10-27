@@ -118,6 +118,9 @@ Requires Windows 10 (2004) or later and a recent stable Rust toolchain.
 cargo build --release -p capshotx
 target\release\CapShotX.exe
 
+# Close any running instance, build, update your local install, and relaunch (for testing)
+.\test-local.bat
+
 # Build the standalone installer + portable bundle into dist\
 .\packaging\build-installer.ps1
 
