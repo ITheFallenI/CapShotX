@@ -518,7 +518,7 @@ dependencies = [
 
 [[package]]
 name = "capshotx"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "capture",
@@ -540,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "capshotx-installer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "directories",
@@ -554,7 +554,7 @@ dependencies = [
 
 [[package]]
 name = "capture"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "platform-windows",
  "png",
@@ -1170,7 +1170,7 @@ dependencies = [
 
 [[package]]
 name = "gallery"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "image",
  "media",
@@ -1833,7 +1833,7 @@ dependencies = [
 
 [[package]]
 name = "media"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tracing",
  "windows",
@@ -2464,7 +2464,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "platform-windows"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tracing",
  "windows",
@@ -2642,7 +2642,7 @@ dependencies = [
 
 [[package]]
 name = "recorder"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "media",
  "platform-windows",
