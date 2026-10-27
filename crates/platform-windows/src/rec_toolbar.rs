@@ -10,7 +10,7 @@ use std::sync::Once;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_U;
 use windows::Win32::Graphics::Direct2D::{D2D1_ELLIPSE, D2D1_ROUNDED_RECT, ID2D1HwndRenderTarget, ID2D1RenderTarget};
 use windows::Win32::Graphics::DirectWrite::IDWriteTextFormat;
@@ -23,15 +23,17 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
-use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CS_DROPSHADOW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
-    GetMessageW, GetWindowLongPtrW, HTCAPTION, HTCLIENT, IDC_ARROW, LoadCursorW, MSG,
+    GetMessageW, GetWindowLongPtrW, HTCAPTION, HTCLIENT, IDC_ARROW, IDC_HAND, LoadCursorW, MSG,
     PostMessageW, PostQuitMessage, RegisterClassExW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
-    SetTimer, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
-    WDA_EXCLUDEFROMCAPTURE, WM_CLOSE, WM_ERASEBKGND, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
-    WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP,
+    SetCursor, SetTimer, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
+    WDA_EXCLUDEFROMCAPTURE, WM_CLOSE, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
+    WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{BOOL, Interface, PCWSTR, Result, w};
 
@@ -41,6 +43,7 @@ use crate::d2d::{self, Factories};
 pub struct ToolbarStatus {
     pub elapsed: Duration,
     pub paused: bool,
+    pub muted: bool,
     /// Current audio peak, 0..=1 (`None`: no audio being recorded).
     pub level: Option<f32>,
     pub warning: Option<String>,
@@ -51,6 +54,7 @@ pub struct ToolbarStatus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolbarAction {
     TogglePause,
+    ToggleMute,
     /// Stop (or cancel during the countdown).
     Stop,
 }
@@ -59,12 +63,15 @@ type StatusFn = Box<dyn Fn() -> ToolbarStatus + Send>;
 type ActionFn = Box<dyn Fn(ToolbarAction) + Send>;
 
 const CLASS_NAME: PCWSTR = w!("CapShotX.RecordingToolbar");
-const WIDTH: f32 = 248.0;
+const WIDTH: f32 = 268.0;
 const BAR_H: f32 = 44.0;
 const WARN_H: f32 = 26.0;
 const BUTTON: f32 = 30.0;
+const MUTE_X: f32 = 136.0;
+const MUTE_W: f32 = 55.0;
 const TIMER_ID: usize = 1;
 const WM_MOUSELEAVE: u32 = 0x02A3;
+const WM_DPICHANGED: u32 = 0x02E0;
 
 /// Keeps the toolbar open; dropping it closes the window.
 pub struct RecordingToolbar {
@@ -108,6 +115,7 @@ impl Drop for RecordingToolbar {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Hit {
     None,
+    Mute,
     Pause,
     Stop,
 }
@@ -116,6 +124,7 @@ struct Graphics {
     target: ID2D1HwndRenderTarget,
     time: IDWriteTextFormat,
     small: IDWriteTextFormat,
+    small_center: IDWriteTextFormat,
 }
 
 struct State {
@@ -125,6 +134,7 @@ struct State {
     dark: bool,
     scale: f32,
     hover: Hit,
+    pressed: Hit,
     meter: f32,
     blink: u32,
     gfx: Option<Graphics>,
@@ -156,6 +166,7 @@ fn run(near: (i32, i32), dark: bool, status_fn: StatusFn, on_action: ActionFn, r
                 dark,
                 scale,
                 hover: Hit::None,
+                pressed: Hit::None,
                 meter: 0.0,
                 blink: 0,
                 gfx: None,
@@ -238,13 +249,16 @@ fn buttons() -> ((f32, f32), (f32, f32)) {
     ((pause_x, top), (stop_x, top))
 }
 
-fn hit(x: f32, y: f32) -> Hit {
+fn hit(x: f32, y: f32, can_mute: bool) -> Hit {
+    let top = (BAR_H - BUTTON) / 2.0;
     let ((px, py), (sx, sy)) = buttons();
     let inside = |bx: f32, by: f32| x >= bx && x < bx + BUTTON && y >= by && y < by + BUTTON;
     if inside(px, py) {
         Hit::Pause
     } else if inside(sx, sy) {
         Hit::Stop
+    } else if can_mute && x >= MUTE_X && x < MUTE_X + MUTE_W && y >= top && y < top + BUTTON {
+        Hit::Mute
     } else {
         Hit::None
     }
@@ -285,6 +299,7 @@ impl State {
             self.gfx = Some(Graphics {
                 time: f.text_format(15.0, d2d::DWRITE_FONT_WEIGHT_SEMI_BOLD, d2d::DWRITE_PARAGRAPH_ALIGNMENT_CENTER, d2d::DWRITE_TEXT_ALIGNMENT_LEADING)?,
                 small: f.text_format(12.0, d2d::DWRITE_FONT_WEIGHT_NORMAL, d2d::DWRITE_PARAGRAPH_ALIGNMENT_CENTER, d2d::DWRITE_TEXT_ALIGNMENT_LEADING)?,
+                small_center: f.text_format(11.5, d2d::DWRITE_FONT_WEIGHT_SEMI_BOLD, d2d::DWRITE_PARAGRAPH_ALIGNMENT_CENTER, d2d::DWRITE_TEXT_ALIGNMENT_CENTER)?,
                 target,
             });
         }
@@ -328,15 +343,43 @@ impl State {
                 d2d::draw_text(&t, "Paused", &g.small, d2d::rect(84.0, 0.0, 140.0, BAR_H), &muted_b);
             }
 
-            // Level meter.
+            // Clickable audio meter / mute toggle.
             if let (Some(_), None) = (s.level, s.countdown) {
-                let (mx, mw) = (130.0, 40.0);
-                let bar = |w: f32| D2D1_ROUNDED_RECT { rect: d2d::rect(mx, mid - 3.0, mx + w, mid + 3.0), radiusX: 3.0, radiusY: 3.0 };
-                t.FillRoundedRectangle(&bar(mw), &d2d::brush(&t, track)?);
-                let w = (self.meter.sqrt() * mw).max(if self.meter > 0.0005 { 3.0 } else { 0.0 });
-                if w > 0.0 {
-                    let c = if self.meter > 0.9 { red } else if self.meter > 0.5 { amber } else { green };
-                    t.FillRoundedRectangle(&bar(w), &d2d::brush(&t, c)?);
+                let top = (BAR_H - BUTTON) / 2.0;
+                let pill = D2D1_ROUNDED_RECT {
+                    rect: d2d::rect(MUTE_X, top, MUTE_X + MUTE_W, top + BUTTON),
+                    radiusX: 6.0,
+                    radiusY: 6.0,
+                };
+                if s.muted {
+                    let tint = d2d::rgba(239, 68, 68, if self.hover == Hit::Mute { 0.28 } else { 0.18 });
+                    t.FillRoundedRectangle(&pill, &d2d::brush(&t, tint)?);
+                    d2d::draw_text(
+                        &t,
+                        "Muted",
+                        &g.small_center,
+                        d2d::rect(MUTE_X, top, MUTE_X + MUTE_W, top + BUTTON),
+                        &d2d::brush(&t, red)?,
+                    );
+                } else {
+                    let pill_fill = if self.hover == Hit::Mute { hover } else { control };
+                    t.FillRoundedRectangle(&pill, &d2d::brush(&t, pill_fill)?);
+                    t.FillEllipse(
+                        &D2D1_ELLIPSE {
+                            point: windows_numerics::Vector2 { X: MUTE_X + 9.0, Y: mid },
+                            radiusX: 3.0,
+                            radiusY: 3.0,
+                        },
+                        &d2d::brush(&t, green)?,
+                    );
+                    let (mx, mw) = (MUTE_X + 16.0, 32.0);
+                    let bar = |w: f32| D2D1_ROUNDED_RECT { rect: d2d::rect(mx, mid - 3.0, mx + w, mid + 3.0), radiusX: 3.0, radiusY: 3.0 };
+                    t.FillRoundedRectangle(&bar(mw), &d2d::brush(&t, track)?);
+                    let w = (self.meter.sqrt() * mw).max(if self.meter > 0.0005 { 3.0 } else { 0.0 }).min(mw);
+                    if w > 0.0 {
+                        let c = if self.meter > 0.9 { red } else if self.meter > 0.5 { amber } else { green };
+                        t.FillRoundedRectangle(&bar(w), &d2d::brush(&t, c)?);
+                    }
                 }
             }
 
@@ -390,6 +433,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let y = ((lparam.0 >> 16) & 0xffff) as i16 as f32;
             (x / st.scale, y / st.scale)
         };
+        let can_mute = st.status.level.is_some() && st.status.countdown.is_none();
         match msg {
             WM_PAINT => {
                 let mut ps = PAINTSTRUCT::default();
@@ -405,19 +449,48 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 st.tick(hwnd);
                 LRESULT(0)
             }
+            WM_DPICHANGED => {
+                let dpi = ((wparam.0 >> 16) & 0xffff) as u32;
+                let k = (dpi as f32 / 96.0).max(0.5);
+                if (k - st.scale).abs() > 0.01 {
+                    st.scale = k;
+                    let h_dip = if st.status.warning.is_some() { BAR_H + WARN_H } else { BAR_H };
+                    st.size = ((WIDTH * k).round() as u32, (h_dip * k).round() as u32);
+                    st.gfx = None;
+                    let suggested = &*(lparam.0 as *const RECT);
+                    let _ = SetWindowPos(
+                        hwnd,
+                        None,
+                        suggested.left,
+                        suggested.top,
+                        st.size.0 as i32,
+                        st.size.1 as i32,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                LRESULT(0)
+            }
             // Drag anywhere except the buttons.
             WM_NCHITTEST => {
                 let mut p = POINT { x: (lparam.0 & 0xffff) as i16 as i32, y: ((lparam.0 >> 16) & 0xffff) as i16 as i32 };
                 let _ = ScreenToClient(hwnd, &mut p);
-                if hit(p.x as f32 / st.scale, p.y as f32 / st.scale) == Hit::None {
+                if hit(p.x as f32 / st.scale, p.y as f32 / st.scale, can_mute) == Hit::None {
                     LRESULT(HTCAPTION as isize)
                 } else {
                     LRESULT(HTCLIENT as isize)
                 }
             }
+            WM_SETCURSOR => {
+                let clickable = st.hover == Hit::Stop || (st.status.countdown.is_none() && st.hover != Hit::None);
+                if let Ok(c) = LoadCursorW(None, if clickable { IDC_HAND } else { IDC_ARROW }) {
+                    SetCursor(Some(c));
+                }
+                LRESULT(1)
+            }
             WM_MOUSEMOVE => {
                 let (x, y) = client(lparam);
-                let h = hit(x, y);
+                let h = hit(x, y, can_mute);
                 if h != st.hover {
                     st.hover = h;
                     let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
@@ -431,13 +504,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let _ = InvalidateRect(Some(hwnd), None, false);
                 LRESULT(0)
             }
-            WM_LBUTTONUP => {
+            WM_LBUTTONDOWN => {
                 let (x, y) = client(lparam);
-                match hit(x, y) {
-                    Hit::Pause if st.status.countdown.is_none() => (st.on_action)(ToolbarAction::TogglePause),
-                    Hit::Stop => (st.on_action)(ToolbarAction::Stop),
-                    _ => {}
+                st.pressed = hit(x, y, can_mute);
+                if st.pressed != Hit::None {
+                    SetCapture(hwnd);
                 }
+                LRESULT(0)
+            }
+            WM_LBUTTONUP => {
+                let _ = ReleaseCapture();
+                let (x, y) = client(lparam);
+                let h = hit(x, y, can_mute);
+                if h != Hit::None && h == st.pressed {
+                    match h {
+                        Hit::Pause if st.status.countdown.is_none() => (st.on_action)(ToolbarAction::TogglePause),
+                        Hit::Mute if can_mute => (st.on_action)(ToolbarAction::ToggleMute),
+                        Hit::Stop => (st.on_action)(ToolbarAction::Stop),
+                        _ => {}
+                    }
+                }
+                st.pressed = Hit::None;
                 st.tick(hwnd);
                 LRESULT(0)
             }

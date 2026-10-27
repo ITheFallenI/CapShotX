@@ -10,5 +10,5 @@ pub mod audio;
 mod session;
 
 pub use audio::{AudioSource, Kind, SourceStatus};
-pub use session::{AudioInput, Recorder, RecorderHandle, Settings, Summary, partial_path};
+pub use session::{AudioInput, Recorder, RecorderHandle, Settings, Summary, VideoQuality, partial_path, recover_partials};
 pub use video::Target;

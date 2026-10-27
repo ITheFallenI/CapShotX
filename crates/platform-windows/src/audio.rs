@@ -9,8 +9,8 @@ use windows::Win32::Media::Audio::{
     AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_SHAREMODE_SHARED,
     AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_LOOPBACK,
     AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, DEVICE_STATE_ACTIVE, IAudioCaptureClient, IAudioClient,
-    IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, WAVE_FORMAT_PCM, WAVEFORMATEX,
-    WAVEFORMATEXTENSIBLE, eCapture, eConsole, eRender,
+    IAudioRenderClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, WAVE_FORMAT_PCM,
+    WAVEFORMATEX, WAVEFORMATEXTENSIBLE, eCapture, eConsole, eRender,
 };
 use windows::Win32::Media::KernelStreaming::WAVE_FORMAT_EXTENSIBLE;
 use windows::Win32::Media::Multimedia::{KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FORMAT_IEEE_FLOAT};
@@ -315,4 +315,71 @@ pub fn describe_open_error(direction: Direction, err: &windows::core::Error) -> 
         _ if err.code() == AUDCLNT_E_DEVICE_INVALIDATED => format!("{what}: the device was disconnected."),
         _ => format!("{what} couldn't start: {}", err.message()),
     }
+}
+
+/// Plays a short two-note stereo chime (`C5` → `G5`, ~520 ms) on `device_id`
+/// (or the default Windows output device when `None`) so the user can hear the
+/// selected output and watch the Desktop audio level meter respond immediately.
+pub fn play_test_sound(device_id: Option<String>) {
+    let _ = std::thread::Builder::new()
+        .name("desktop-test-sound".into())
+        .spawn(move || {
+            if play_wasapi_chime(device_id.as_deref()).is_err() {
+                crate::sound::play_shutter();
+            }
+        });
+}
+
+fn play_wasapi_chime(device_id: Option<&str>) -> Result<()> {
+    let e = enumerator()?;
+    const DURATION_SECS: f32 = 0.52;
+    let total_frames = (RATE as f32 * DURATION_SECS) as u32;
+    let buffer_100ns = ((DURATION_SECS + 0.15) * 10_000_000.0) as i64;
+
+    // SAFETY: standard WASAPI shared-mode render session on the chosen endpoint.
+    unsafe {
+        let device = match device_id {
+            Some(id) => e.GetDevice(&HSTRING::from(id))?,
+            None => e.GetDefaultAudioEndpoint(eRender, eConsole)?,
+        };
+        let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
+        let wanted = float_format(RATE, CHANNELS);
+        client.Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+            buffer_100ns,
+            0,
+            &wanted,
+            None,
+        )?;
+        let buf_frames = client.GetBufferSize()?;
+        let write_frames = total_frames.min(buf_frames);
+        let render: IAudioRenderClient = client.GetService()?;
+        let data = render.GetBuffer(write_frames)?;
+        let out = std::slice::from_raw_parts_mut(data as *mut f32, write_frames as usize * CHANNELS as usize);
+
+        for i in 0..write_frames as usize {
+            let t = i as f32 / RATE as f32;
+            // Warm two-note chime: C5 (523.25 Hz) then G5 (783.99 Hz) with soft attack/decay.
+            let mut sample = 0.0f32;
+            for (start, freq, amp) in [(0.0f32, 523.25f32, 0.22f32), (0.14f32, 783.99f32, 0.25f32)] {
+                let dt = t - start;
+                if dt >= 0.0 {
+                    let attack = (dt / 0.012).min(1.0);
+                    let decay = (-dt / 0.14).exp();
+                    let fundamental = (std::f32::consts::TAU * freq * dt).sin();
+                    let overtone = 0.25 * (std::f32::consts::TAU * (freq * 2.0) * dt).sin();
+                    sample += amp * attack * decay * (fundamental + overtone);
+                }
+            }
+            let s = sample.clamp(-0.9, 0.9);
+            out[i * 2] = s;
+            out[i * 2 + 1] = s;
+        }
+        render.ReleaseBuffer(write_frames, 0)?;
+        client.Start()?;
+        std::thread::sleep(std::time::Duration::from_millis(550));
+        let _ = client.Stop();
+    }
+    Ok(())
 }

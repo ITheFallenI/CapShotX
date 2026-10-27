@@ -16,7 +16,10 @@ use std::time::Instant;
 use platform_windows::{clipboard, monitors, shell, toast};
 
 pub use frame::Frame;
-pub use output::{DEFAULT_FILE_TEMPLATE, render_template};
+pub use output::{
+    DEFAULT_FILE_TEMPLATE, LEGACY_DEFAULT_FILE_TEMPLATE, LEGACY_DEFAULT_FILE_TEMPLATES, OutputKind,
+    render_output_path, render_template,
+};
 use overlay::{Delivery, OverlayOptions, OverlayResult, Purpose};
 pub use platform_windows::monitors::PixelRect;
 
@@ -48,6 +51,8 @@ pub struct CaptureOptions {
     pub highlight: [u8; 3],
     /// Play a shutter sound when a capture is taken.
     pub sound: bool,
+    /// Show the confirmation toast in the bottom-right corner.
+    pub show_notification: bool,
     /// Theme for the confirmation toast.
     pub dark: bool,
 }
@@ -144,14 +149,16 @@ fn session(options: CaptureOptions, on_finish: impl FnOnce(Finished)) {
         OverlayResult::CopyColor(hex) => match clipboard::set_text(&hex) {
             Ok(()) => {
                 on_finish(finish(CaptureOutcome::ColorCopied(hex.clone())));
-                notify(toast::Toast {
-                    title: format!("Copied {hex}"),
-                    subtitle: "Colour copied to the clipboard".into(),
-                    image: None,
-                    open_on_click: None,
-                    error: false,
-                    dark: options.dark,
-                });
+                if options.show_notification {
+                    notify(toast::Toast {
+                        title: format!("Copied {hex}"),
+                        subtitle: "Colour copied to the clipboard".into(),
+                        image: None,
+                        open_on_click: None,
+                        error: false,
+                        dark: options.dark,
+                    });
+                }
             }
             Err(err) => {
                 let message = format!("Couldn't copy the colour: {err}");
@@ -192,14 +199,16 @@ fn session(options: CaptureOptions, on_finish: impl FnOnce(Finished)) {
                         copied,
                         saved: saved.clone(),
                     }));
-                    notify(toast::Toast {
-                        title: title.into(),
-                        subtitle,
-                        open_on_click: saved,
-                        image: Some(toast::ToastImage { width: image.width(), height: image.height(), bgra: image.bgra }),
-                        error: false,
-                        dark: options.dark,
-                    });
+                    if options.show_notification {
+                        notify(toast::Toast {
+                            title: title.into(),
+                            subtitle,
+                            open_on_click: saved,
+                            image: Some(toast::ToastImage { width: image.width(), height: image.height(), bgra: image.bgra }),
+                            error: false,
+                            dark: options.dark,
+                        });
+                    }
                 }
                 Err(message) => {
                     tracing::error!("capture output failed: {message}");
@@ -212,7 +221,7 @@ fn session(options: CaptureOptions, on_finish: impl FnOnce(Finished)) {
 }
 
 /// What the user picked to record.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum Selection {
     Cancelled,
     Area {
@@ -220,6 +229,8 @@ pub enum Selection {
         rect: PixelRect,
         /// Set when a window was clicked (record the window itself).
         window: Option<isize>,
+        /// Window title at selection time, if a window was clicked.
+        window_title: Option<String>,
     },
 }
 
@@ -244,7 +255,7 @@ pub fn select_area(magnifier: bool, highlight: [u8; 3]) -> Result<Selection, Str
             },
         );
         match result {
-            OverlayResult::Selected { rect, window } => Ok(Selection::Area { rect, window }),
+            OverlayResult::Selected { rect, window, window_title } => Ok(Selection::Area { rect, window, window_title }),
             OverlayResult::Failed(err) => Err(err),
             _ => Ok(Selection::Cancelled),
         }

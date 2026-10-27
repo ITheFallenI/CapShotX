@@ -3,6 +3,7 @@
 //! Works on the original files in the capture folder — nothing is imported
 //! into a database (GAL-02). UI-agnostic: thumbnails come back as RGBA.
 
+mod mp4_dur;
 mod ops;
 mod thumbs;
 
@@ -12,7 +13,7 @@ use std::time::SystemTime;
 use platform_windows::shell::{LocalTime, local_time, local_time_of};
 
 pub use ops::{copy_image, load_full, rename};
-pub use thumbs::{Thumbnail, Thumbnailer};
+pub use thumbs::{Thumbnail, Thumbnailer, warm_cache};
 
 const EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "bmp", "webp", "mp4"];
 const VIDEO_EXTENSIONS: &[&str] = &["mp4"];
@@ -22,6 +23,20 @@ pub fn is_video(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| VIDEO_EXTENSIONS.iter().any(|x| e.eq_ignore_ascii_case(x)))
+}
+
+/// Probes the duration of a video file from its MP4 header (fast, pure Rust
+/// first so Media Foundation codecs aren't loaded just for cached thumbnails).
+pub fn video_duration(path: &Path) -> Option<std::time::Duration> {
+    if !is_video(path) {
+        return None;
+    }
+    mp4_dur::parse(path).or_else(|| {
+        media::probe(path)
+            .ok()
+            .filter(|i| i.duration > 0)
+            .map(|i| std::time::Duration::from_nanos((i.duration * 100) as u64))
+    })
 }
 
 /// Decodes an image, or a video's first frame.
@@ -35,8 +50,8 @@ fn open_visual(path: &Path) -> Result<image::DynamicImage, String> {
         image::open(path).map_err(|e| e.to_string())
     }
 }
-/// Captures use dated sub-folders; don't wander deeper than this.
-const MAX_DEPTH: usize = 4;
+/// Captures use dated + Images/Video sub-folders; don't wander deeper than this.
+const MAX_DEPTH: usize = 6;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Entry {
@@ -172,18 +187,22 @@ mod tests {
     }
 
     #[test]
-    fn scan_finds_nested_images_newest_first() {
+    fn scan_finds_nested_images_and_videos_newest_first() {
         let dir = std::env::temp_dir().join(format!("capshotx-gallery-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("2026-10")).unwrap();
+        std::fs::create_dir_all(dir.join("2026-10").join("Images")).unwrap();
+        std::fs::create_dir_all(dir.join("2026-10").join("Video")).unwrap();
         std::fs::write(dir.join("old.png"), b"x").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::write(dir.join("2026-10").join("new.png"), b"x").unwrap();
+        std::fs::write(dir.join("2026-10").join("Images").join("new.png"), b"x").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(dir.join("2026-10").join("Video").join("clip.mp4"), b"x").unwrap();
         std::fs::write(dir.join("notes.txt"), b"x").unwrap();
         std::fs::write(dir.join("half.png.partial"), b"x").unwrap();
+        std::fs::write(dir.join("2026-10").join("Video").join("crash.mp4.partial"), b"x").unwrap();
 
         let names: Vec<String> = scan(&dir).into_iter().map(|e| e.name).collect();
-        assert_eq!(names, ["new.png", "old.png"]);
+        assert_eq!(names, ["clip.mp4", "new.png", "old.png"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

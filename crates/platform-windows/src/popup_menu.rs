@@ -36,20 +36,24 @@ use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO,
     MonitorFromPoint, PAINTSTRUCT,
 };
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::LibraryLoader::{
+    GetModuleHandleW, GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VIRTUAL_KEY, VK_DOWN, VK_ESCAPE, VK_RETURN,
     VK_SPACE, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, CS_DROPSHADOW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA,
-    GetCursorPos, GetWindowLongPtrW, IDC_ARROW, LoadCursorW, RegisterClassExW, SW_SHOW,
-    SetForegroundWindow, SetWindowLongPtrW, ShowWindow, WA_INACTIVE, WM_ACTIVATE, WM_ERASEBKGND,
-    WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
-    WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    AppendMenuW, CREATESTRUCTW, CS_DROPSHADOW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+    DestroyMenu, DestroyWindow, GWLP_USERDATA, GetCursorPos, GetMessagePos, GetWindowLongPtrW,
+    IDC_ARROW, LoadCursorW, MF_SEPARATOR, MF_STRING, PostMessageW, RegisterClassExW, SW_SHOW,
+    SetForegroundWindow, SetMenuDefaultItem, SetWindowLongPtrW, ShowWindow, TPM_BOTTOMALIGN,
+    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WA_INACTIVE, WM_ACTIVATE,
+    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NULL,
+    WM_PAINT, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPED, WS_POPUP,
 };
-use windows::core::{BOOL, PCWSTR, Result, w};
+use windows::core::{BOOL, HSTRING, PCSTR, PCWSTR, Result, w};
 
 /// One row of the menu.
 pub enum MenuEntry {
@@ -121,8 +125,7 @@ pub fn show_popup_menu(
 
     // SAFETY: plain Win32 queries with valid out-pointers.
     let (cursor, work, dpi) = unsafe {
-        let mut cursor = POINT::default();
-        GetCursorPos(&mut cursor)?;
+        let cursor = cursor_pos();
         let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
         let (mut dpi_x, mut dpi_y) = (96, 96);
         GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y)?;
@@ -679,6 +682,142 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+}
+
+/// Shows a lightweight native Win32 popup menu (`CreatePopupMenu` +
+/// `TrackPopupMenuEx`) near the mouse cursor without initialising Direct2D,
+/// DirectWrite or any GPU surface. Used in Low memory mode.
+pub fn show_native_popup_menu(
+    entries: Vec<MenuEntry>,
+    theme: MenuTheme,
+    on_select: impl FnOnce(&str),
+) -> Result<()> {
+    close_popup_menu();
+    // PreferredAppMode: 1 = AllowDark, 2 = ForceDark, 3 = ForceLight.
+    set_uxtheme_app_mode(if theme.dark { 2 } else { 3 });
+
+    // SAFETY: creates a temporary invisible Win32 owner window and HMENU on
+    // the calling thread; both are unconditionally destroyed before returning.
+    unsafe {
+        let cursor = cursor_pos();
+
+        let instance = GetModuleHandleW(None)?;
+        let owner = CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            w!("STATIC"),
+            w!(""),
+            WS_OVERLAPPED,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            Some(instance.into()),
+            None,
+        )?;
+
+        let hmenu = match CreatePopupMenu() {
+            Ok(m) => m,
+            Err(err) => {
+                let _ = DestroyWindow(owner);
+                set_uxtheme_app_mode(1);
+                return Err(err);
+            }
+        };
+
+        let mut ids = Vec::new();
+        for entry in entries {
+            match entry {
+                MenuEntry::Item { id, label } => {
+                    ids.push(id);
+                    let cmd_id = ids.len();
+                    let wide = HSTRING::from(label);
+                    let _ = AppendMenuW(hmenu, MF_STRING, cmd_id, &wide);
+                    if cmd_id == 1 {
+                        let _ = SetMenuDefaultItem(hmenu, 1, 0);
+                    }
+                }
+                MenuEntry::Separator => {
+                    let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
+                }
+            }
+        }
+
+        // Microsoft Shell_NotifyIcon requirement (KB135788): foreground the
+        // owner before TrackPopupMenuEx and post WM_NULL afterwards so clicking
+        // outside the menu dismisses it immediately.
+        let _ = SetForegroundWindow(owner);
+        let flags = (TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN).0;
+        let chosen = TrackPopupMenuEx(hmenu, flags, cursor.x, cursor.y, owner, None).0 as usize;
+        let _ = PostMessageW(Some(owner), WM_NULL, WPARAM(0), LPARAM(0));
+
+        let _ = DestroyMenu(hmenu);
+        let _ = DestroyWindow(owner);
+        set_uxtheme_app_mode(1);
+
+        if let Some(id) = chosen.checked_sub(1).and_then(|i| ids.get(i)) {
+            on_select(id);
+        }
+        Ok(())
+    }
+}
+
+/// Queries the cursor position, falling back to `GetMessagePos` if UIPI blocks
+/// `GetCursorPos` while an elevated window (e.g. Task Manager) has focus.
+fn cursor_pos() -> POINT {
+    let mut pt = POINT::default();
+    // SAFETY: valid out-pointer; GetMessagePos has no preconditions.
+    unsafe {
+        if GetCursorPos(&mut pt).is_ok() {
+            pt
+        } else {
+            let packed = GetMessagePos();
+            POINT {
+                x: (packed & 0xffff) as i16 as i32,
+                y: ((packed >> 16) & 0xffff) as i16 as i32,
+            }
+        }
+    }
+}
+
+/// Applies Windows 10 1903+ / Windows 11 native menu dark/light styling via
+/// `uxtheme.dll` ordinals 135 (`SetPreferredAppMode`) and 136 (`FlushMenuThemes`).
+fn set_uxtheme_app_mode(mode: i32) {
+    // SAFETY: loads uxtheme from System32 only and calls stable ordinals if present.
+    unsafe {
+        let Ok(uxtheme) = LoadLibraryExW(w!("uxtheme.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32)
+        else {
+            return;
+        };
+        if let Some(set_mode) = GetProcAddress(uxtheme, PCSTR(135usize as *const u8)) {
+            let f: unsafe extern "system" fn(i32) -> i32 = std::mem::transmute(set_mode);
+            let _ = f(mode);
+        }
+        if let Some(flush) = GetProcAddress(uxtheme, PCSTR(136usize as *const u8)) {
+            let f: unsafe extern "system" fn() = std::mem::transmute(flush);
+            f();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uxtheme_mode_and_hmenu_build_cleanly() {
+        set_uxtheme_app_mode(2);
+        set_uxtheme_app_mode(3);
+        set_uxtheme_app_mode(1);
+        unsafe {
+            let hmenu = CreatePopupMenu().unwrap();
+            AppendMenuW(hmenu, MF_STRING, 1, &HSTRING::from("Open CapShotX")).unwrap();
+            AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null()).unwrap();
+            SetMenuDefaultItem(hmenu, 1, 0).unwrap();
+            DestroyMenu(hmenu).unwrap();
         }
     }
 }

@@ -20,13 +20,14 @@ impl SessionClock {
 
     pub fn pause(&mut self, now: i64) {
         if !self.is_paused() {
-            self.pauses.push((now, None));
+            let floor = self.pauses.last().and_then(|&(_, e)| e).unwrap_or(self.start);
+            self.pauses.push((now.max(floor), None));
         }
     }
 
     pub fn resume(&mut self, now: i64) {
-        if let Some((_, end @ None)) = self.pauses.last_mut() {
-            *end = Some(now);
+        if let Some((start, end @ None)) = self.pauses.last_mut() {
+            *end = Some(now.max(*start));
         }
     }
 
@@ -52,7 +53,10 @@ impl SessionClock {
     /// Recording time "now": while paused it stays where the pause began.
     pub fn elapsed(&self, now: i64) -> i64 {
         match self.pauses.last() {
-            Some(&(s, None)) => self.active_at(s - 1).map_or(0, |t| t + 1),
+            Some(&(s, None)) => {
+                let closed: i64 = self.pauses.iter().filter_map(|&(ps, pe)| pe.map(|e| e - ps)).sum();
+                (s - self.start - closed).max(0)
+            }
             _ => self.active_at(now).unwrap_or(0),
         }
     }
@@ -83,5 +87,15 @@ mod tests {
         c.pause(3_000);
         // Spec scenario: stopping while paused must not include the pause.
         assert_eq!(c.elapsed(50_000), 3_000);
+    }
+
+    #[test]
+    fn resume_then_immediate_pause_preserves_elapsed() {
+        let mut c = SessionClock::new(0);
+        c.pause(2_000);
+        c.resume(3_000);
+        c.pause(3_000);
+        assert_eq!(c.elapsed(3_000), 2_000);
+        assert_eq!(c.elapsed(9_000), 2_000);
     }
 }

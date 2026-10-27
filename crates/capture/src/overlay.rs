@@ -60,9 +60,13 @@ pub enum OverlayResult {
     Failed(String),
     CopyColor(String),
     Commit { rect: PixelRect, delivery: Delivery },
-    /// Selection-only purposes (recording): the area, and the window if one
-    /// was clicked.
-    Selected { rect: PixelRect, window: Option<isize> },
+    /// Selection-only purposes (recording): the area, and the window (plus
+    /// title) if a window was clicked rather than dragged.
+    Selected {
+        rect: PixelRect,
+        window: Option<isize>,
+        window_title: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -194,10 +198,21 @@ struct Overlay {
 }
 
 fn cursor_pos() -> (i32, i32) {
+    platform_windows::shell::cursor_pos()
+}
+
+fn mouse_pos(surface_origin: Option<(i32, i32)>, lparam: LPARAM) -> (i32, i32) {
     let mut p = POINT::default();
-    // SAFETY: valid out-pointer.
-    let _ = unsafe { GetCursorPos(&mut p) };
-    (p.x, p.y)
+    // SAFETY: valid out-pointer; falls back to surface-local lparam if UIPI blocks GetCursorPos.
+    if unsafe { GetCursorPos(&mut p) }.is_ok() {
+        (p.x, p.y)
+    } else if let Some((ox, oy)) = surface_origin {
+        let lx = (lparam.0 & 0xffff) as i16 as i32;
+        let ly = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+        (ox + lx, oy + ly)
+    } else {
+        platform_windows::shell::cursor_pos()
+    }
 }
 
 fn key_down(vk: u16) -> bool {
@@ -340,8 +355,24 @@ impl Overlay {
     }
 
     fn drag_rect(&self, anchor: (i32, i32)) -> PixelRect {
-        let r = PixelRect::spanning(anchor, self.cursor);
-        r.intersect(&self.frame.bounds).unwrap_or(r)
+        let limit = if self.options.purpose == Purpose::Record {
+            self.surface_at(anchor.0, anchor.1)
+                .map_or(self.frame.bounds, |i| self.surfaces[i].monitor.bounds)
+        } else {
+            self.frame.bounds
+        };
+        let cx = self.cursor.0.clamp(limit.left, limit.right - 1);
+        let cy = self.cursor.1.clamp(limit.top, limit.bottom - 1);
+        let mut r = PixelRect::spanning(anchor, (cx, cy));
+        if self.options.purpose == Purpose::Record {
+            const MIN_REC: i32 = 32;
+            let w = (r.width().max(MIN_REC) & !1).min(limit.width() & !1);
+            let h = (r.height().max(MIN_REC) & !1).min(limit.height() & !1);
+            let left = r.left.clamp(limit.left, (limit.right - w).max(limit.left));
+            let top = r.top.clamp(limit.top, (limit.bottom - h).max(limit.top));
+            r = PixelRect { left, top, right: left + w, bottom: top + h };
+        }
+        r.intersect(&limit).unwrap_or(r)
     }
 
     fn is_drag(&self, anchor: (i32, i32)) -> bool {
@@ -474,15 +505,20 @@ impl Overlay {
     }
 
     /// A selection was made (drag released or target clicked).
-    fn complete(&mut self, rect: Option<PixelRect>) {
+    fn complete(&mut self, rect: Option<PixelRect>, allow_window: bool) {
         let Some(rect) = rect.filter(|r| !r.is_empty()) else { return };
         if self.options.purpose == Purpose::Record {
-            // A click on a window records that window (follows it if moved).
-            let window = self
-                .hover_window()
-                .filter(|w| w.rect.intersect(&self.frame.bounds) == Some(rect))
-                .map(|w| w.hwnd);
-            self.finish(OverlayResult::Selected { rect, window });
+            // A click on a window records that window (follows it if moved);
+            // dragging a box or pressing F records the monitor region.
+            let win = allow_window
+                .then(|| self.hover_window())
+                .flatten()
+                .filter(|w| w.rect.intersect(&self.frame.bounds) == Some(rect));
+            let window = win.map(|w| w.hwnd);
+            let window_title = win
+                .map(|w| w.title.trim().to_owned())
+                .filter(|t| !t.is_empty());
+            self.finish(OverlayResult::Selected { rect, window, window_title });
         } else if self.options.after == AfterCapture::Ask {
             self.phase = Phase::Selected { rect };
         } else {
@@ -497,7 +533,8 @@ impl Overlay {
             _ => self.highlight(),
         };
         if self.options.purpose == Purpose::Record {
-            self.complete(rect);
+            let allow_window = matches!(self.phase, Phase::Hover);
+            self.complete(rect, allow_window);
         } else if let Some(rect) = rect {
             self.finish(OverlayResult::Commit { rect, delivery });
         }
@@ -531,17 +568,18 @@ impl Overlay {
         let pressed = self.pressed_at.take();
         match self.phase {
             Phase::Dragging { anchor } => {
-                let target = if self.is_drag(anchor) {
+                let dragged = self.is_drag(anchor);
+                let target = if dragged {
                     Some(self.drag_rect(anchor))
                 } else {
                     self.hover_target()
                 };
                 self.phase = Phase::Hover;
-                self.complete(target);
+                self.complete(target, !dragged);
             }
             Phase::Hover if pressed.is_some() => {
                 let target = self.hover_target();
-                self.complete(target);
+                self.complete(target, true);
             }
             Phase::Adjusting { grip, start, from } => {
                 self.phase = Phase::Selected { rect: self.adjusted(grip, start, from) };
@@ -587,7 +625,7 @@ impl Overlay {
                 // F: the whole monitor under the cursor.
                 let target = self.monitor_at_cursor();
                 self.phase = Phase::Hover;
-                self.complete(target);
+                self.complete(target, false);
             }
             0x5A => self.magnifier = !self.magnifier, // Z
             v if [VK_LEFT.0, VK_RIGHT.0, VK_UP.0, VK_DOWN.0].contains(&v) => {
@@ -979,7 +1017,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             WM_ERASEBKGND => LRESULT(1),
             WM_MOUSEMOVE => {
-                let cursor = cursor_pos();
+                let origin = index.map(|i| (o.surfaces[i].monitor.bounds.left, o.surfaces[i].monitor.bounds.top));
+                let cursor = mouse_pos(origin, lparam);
                 if cursor != o.cursor {
                     let previous = std::mem::replace(&mut o.cursor, cursor);
                     o.invalidate_after_move(previous);
@@ -987,13 +1026,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 LRESULT(0)
             }
             WM_LBUTTONDOWN => {
-                o.cursor = cursor_pos();
+                let origin = index.map(|i| (o.surfaces[i].monitor.bounds.left, o.surfaces[i].monitor.bounds.top));
+                o.cursor = mouse_pos(origin, lparam);
                 o.on_mouse_down(hwnd);
                 o.invalidate();
                 LRESULT(0)
             }
             WM_LBUTTONUP => {
-                o.cursor = cursor_pos();
+                let origin = index.map(|i| (o.surfaces[i].monitor.bounds.left, o.surfaces[i].monitor.bounds.top));
+                o.cursor = mouse_pos(origin, lparam);
                 o.on_mouse_up();
                 o.invalidate();
                 LRESULT(0)

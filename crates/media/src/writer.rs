@@ -6,7 +6,8 @@ use windows::Win32::Media::MediaFoundation::{
     IMFAttributes, IMFMediaType, IMFSinkWriter, MF_MT_AAC_PAYLOAD_TYPE, MF_MT_AUDIO_AVG_BYTES_PER_SECOND,
     MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_BLOCK_ALIGNMENT, MF_MT_AUDIO_NUM_CHANNELS,
     MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE,
-    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE,
+    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MAX_KEYFRAME_SPACING,
+    MF_MT_MPEG2_PROFILE,
     MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS,
     MF_SINK_WRITER_DISABLE_THROTTLING, MF_TRANSCODE_CONTAINERTYPE, MFAudioFormat_AAC, MFAudioFormat_PCM,
     MFCreateAttributes, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
@@ -100,6 +101,9 @@ impl Mp4Writer {
             out.SetUINT64(&MF_MT_FRAME_SIZE, size)?;
             out.SetUINT64(&MF_MT_FRAME_RATE, rate)?;
             out.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, square)?;
+            // Force a 2 s keyframe interval so fragmented MP4 flushes self-contained
+            // fragments every ~2 s (crash recovery) and timeline seeking stays snappy.
+            out.SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, video.fps.max(1) * 2)?;
             let video_stream = writer.AddStream(&out)?;
 
             let input = new_type()?;

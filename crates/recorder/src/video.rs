@@ -89,8 +89,23 @@ impl VideoSource {
         let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
         let (item, crop, width, height): (GraphicsCaptureItem, _, _, _) = match target {
             Target::Window(hwnd) => {
-                // SAFETY: an invalid HWND just fails the call.
-                let item: GraphicsCaptureItem = unsafe { interop.CreateForWindow(HWND(hwnd as _))? };
+                let w = HWND(hwnd as _);
+                // SAFETY: plain window status checks; an invalid HWND fails cleanly.
+                unsafe {
+                    if !windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(w)).as_bool() {
+                        return Err(windows::core::Error::new(
+                            windows::Win32::Foundation::E_INVALIDARG,
+                            "The selected window was closed before recording started",
+                        ));
+                    }
+                    if windows::Win32::UI::WindowsAndMessaging::IsIconic(w).as_bool() {
+                        return Err(windows::core::Error::new(
+                            windows::Win32::Foundation::E_INVALIDARG,
+                            "The selected window is minimised — restore it to record",
+                        ));
+                    }
+                }
+                let item: GraphicsCaptureItem = unsafe { interop.CreateForWindow(w)? };
                 let size = item.Size()?;
                 (item, None, even(size.Width), even(size.Height))
             }

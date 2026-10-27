@@ -18,6 +18,14 @@ use crate::video::{Target, VideoSource};
 /// Audio still in flight is allowed this long before it's mixed.
 const AUDIO_LATENCY: i64 = TICKS / 5;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VideoQuality {
+    Compact,
+    #[default]
+    Balanced,
+    High,
+}
+
 #[derive(Clone, Debug)]
 pub struct AudioInput {
     /// `None` = system default.
@@ -29,6 +37,7 @@ pub struct AudioInput {
 pub struct Settings {
     pub target: Target,
     pub fps: u32,
+    pub quality: VideoQuality,
     pub cursor: bool,
     pub desktop: Option<AudioInput>,
     pub microphone: Option<AudioInput>,
@@ -62,6 +71,7 @@ pub struct RecorderHandle {
     clock: Arc<Mutex<Option<SessionClock>>>,
     audio: Vec<(Kind, Arc<SourceStatus>)>,
     mixer: Arc<Mutex<Mixer>>,
+    muted: Arc<AtomicBool>,
     counters: Arc<Counters>,
     video_lost: Arc<AtomicBool>,
 }
@@ -131,6 +141,7 @@ impl Recorder {
             clock: clock_slot,
             audio: sources.iter().map(|s| (s.kind, s.status.clone())).collect(),
             mixer,
+            muted: Arc::new(AtomicBool::new(false)),
             counters,
             video_lost,
         };
@@ -172,7 +183,21 @@ impl RecorderHandle {
 
     /// Loudest current peak across sources (0..=1), for a single meter.
     pub fn peak(&self) -> f32 {
+        if self.is_muted() {
+            return 0.0;
+        }
         self.audio.iter().map(|(_, s)| s.levels().0).fold(0.0, f32::max)
+    }
+
+    /// Mutes or unmutes all recorded audio tracks while preserving each
+    /// track's configured gain.
+    pub fn set_muted(&self, muted: bool) {
+        self.muted.store(muted, Ordering::Release);
+        self.mixer.lock().unwrap().set_muted(muted);
+    }
+
+    pub fn is_muted(&self) -> bool {
+        self.muted.load(Ordering::Acquire)
     }
 
     /// Something needs the user's attention (device lost, window closed).
@@ -259,10 +284,14 @@ pub fn partial_path(output: &Path) -> PathBuf {
     output.with_file_name(name)
 }
 
-/// Video bitrate for good screen-content quality (~0.1 bits/pixel/frame).
-fn bitrate(width: u32, height: u32, fps: u32) -> u32 {
-    let bpp = if fps > 30 { 0.07 } else { 0.1 };
-    ((width as f64 * height as f64 * fps as f64 * bpp) as u32).clamp(2_000_000, 60_000_000)
+/// Video bitrate scaled by resolution, frame rate and chosen quality preset.
+fn bitrate(width: u32, height: u32, fps: u32, quality: VideoQuality) -> u32 {
+    let (bpp, min, max) = match quality {
+        VideoQuality::Compact => (if fps > 30 { 0.042 } else { 0.06 }, 1_200_000, 35_000_000),
+        VideoQuality::Balanced => (if fps > 30 { 0.07 } else { 0.10 }, 2_000_000, 60_000_000),
+        VideoQuality::High => (if fps > 30 { 0.12 } else { 0.18 }, 3_500_000, 90_000_000),
+    };
+    ((width as f64 * height as f64 * fps as f64 * bpp) as u32).clamp(min, max)
 }
 
 fn encode(ctx: EncoderCtx, started: mpsc::Sender<Result<(), String>>, finish: mpsc::Receiver<i64>) -> Result<Summary, String> {
@@ -277,9 +306,19 @@ fn encode(ctx: EncoderCtx, started: mpsc::Sender<Result<(), String>>, finish: mp
     if let Some(dir) = partial.parent() {
         std::fs::create_dir_all(dir).map_err(|e| fail(format!("Couldn't create {}: {e}", dir.display())))?;
     }
-    let audio_cfg = ctx.has_audio.then(AudioConfig::default);
-    let mut writer = Mp4Writer::create(&partial, VideoConfig { width, height, fps, bitrate: bitrate(width, height, fps) }, audio_cfg)
-        .map_err(|e| fail(format!("Couldn't create the video file: {}", e.message())))?;
+    let audio_cfg = ctx.has_audio.then(|| {
+        let mut cfg = AudioConfig::default();
+        if s.quality == VideoQuality::Compact {
+            cfg.bitrate = 128_000;
+        }
+        cfg
+    });
+    let mut writer = Mp4Writer::create(
+        &partial,
+        VideoConfig { width, height, fps, bitrate: bitrate(width, height, fps, s.quality) },
+        audio_cfg,
+    )
+    .map_err(|e| fail(format!("Couldn't create the video file: {}", e.message())))?;
 
     // Give WGC a moment to deliver the first real frame (avoids a black start).
     let wait_until = std::time::Instant::now() + Duration::from_millis(500);
@@ -304,7 +343,10 @@ fn encode(ctx: EncoderCtx, started: mpsc::Sender<Result<(), String>>, finish: mp
     let mut warnings = Vec::new();
     let mut result: Result<(), String> = Ok(());
     let end = loop {
-        let stop_at = finish.try_recv().ok();
+        let stop_at = finish
+            .try_recv()
+            .ok()
+            .map(|e| e.max(frame_dur).max(next_frame * frame_dur));
         let now = stop_at.unwrap_or_else(|| ctx.clock.lock().unwrap().as_ref().unwrap().elapsed(clock::now()));
 
         if video.is_closed() && !ctx.video_lost.swap(true, Ordering::Relaxed) {
@@ -403,4 +445,160 @@ fn unique(path: &Path) -> PathBuf {
 fn mmss(t: i64) -> String {
     let s = t.max(0) / TICKS;
     format!("{}:{:02}", s / 60, s % 60)
+}
+
+/// Scans `folder` (up to depth 6) for interrupted `*.mp4.partial` recordings
+/// left behind by a crash or power loss. Playable fragmented MP4s are renamed
+/// to `<stem> (recovered).mp4`; unreadable or empty partials are left on disk
+/// untouched (never deleted before verification, spec §9.5).
+pub fn recover_partials(folder: &Path) -> Vec<PathBuf> {
+    let mut partials = Vec::new();
+    collect_partials(folder, 0, &mut partials);
+    let mut recovered = Vec::new();
+    for partial in partials {
+        let Ok(meta) = std::fs::metadata(&partial) else { continue };
+        if meta.len() == 0 {
+            continue;
+        }
+        let Some(name) = partial.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some(mp4_name) = strip_partial_suffix(name) else { continue };
+        let base = partial.with_file_name(mp4_name);
+        let stem = base.file_stem().unwrap_or_default().to_string_lossy();
+        let candidate = unique(&partial.with_file_name(format!("{stem} (recovered).mp4")));
+        if std::fs::rename(&partial, &candidate).is_err() {
+            // Likely still open by an active writer; leave alone.
+            continue;
+        }
+        let playable = media::probe(&candidate)
+            .ok()
+            .filter(|info| info.has_video && info.width > 0 && info.height > 0)
+            .and_then(|_| media::poster_frame(&candidate).ok())
+            .is_some();
+        if playable {
+            tracing::info!(path = %candidate.display(), "recovered interrupted recording");
+            recovered.push(candidate);
+        } else {
+            tracing::warn!(path = %partial.display(), "unreadable .partial left untouched");
+            let _ = std::fs::rename(&candidate, &partial);
+        }
+    }
+    recovered
+}
+
+fn strip_partial_suffix(name: &str) -> Option<&str> {
+    if name.len() > ".mp4.partial".len() && name[name.len() - 8..].eq_ignore_ascii_case(".partial") {
+        let trimmed = &name[..name.len() - 8];
+        if trimmed.len() > 4 && trimmed[trimmed.len() - 4..].eq_ignore_ascii_case(".mp4") {
+            return Some(trimmed);
+        }
+    }
+    None
+}
+
+fn collect_partials(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth > 6 {
+        return;
+    }
+    let Ok(read) = std::fs::read_dir(dir) else { return };
+    for entry in read.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        let path = entry.path();
+        if ft.is_dir() {
+            collect_partials(&path, depth + 1, out);
+        } else if ft.is_file()
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(strip_partial_suffix)
+                .is_some()
+        {
+            out.push(path);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovers_unfinalised_fragmented_partial_and_keeps_corrupt_partial() {
+        let dir = std::env::temp_dir().join(format!("capshotx-recover-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sub = dir.join("2026-10").join("Video");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let partial = sub.join("CapShotX_crash.mp4.partial");
+        {
+            let mut w = Mp4Writer::create(
+                &partial,
+                VideoConfig { width: 320, height: 240, fps: 30, bitrate: 1_500_000 },
+                None,
+            )
+            .expect("create writer");
+            assert!(w.fragmented, "Windows 11 should provide fragmented MP4");
+            let frame_dur = TICKS / 30;
+            let mut bgra = vec![0u8; 320 * 240 * 4];
+            for px in bgra.chunks_exact_mut(4) {
+                px.copy_from_slice(&[40, 180, 90, 255]);
+            }
+            // Write 3 s of video (>1 keyframe interval) so fMP4 flushes a fragment,
+            // give async hardware MFT a moment to drain into the sink, then drop WITHOUT finish().
+            for i in 0..90 {
+                w.write_video(&bgra, i * frame_dur, frame_dur).unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        // In-process drop without Finalize() releases IMFByteStream on an MF work-queue thread.
+        for _ in 0..40 {
+            if std::fs::OpenOptions::new().write(true).open(&partial).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let partial_bytes = std::fs::metadata(&partial).map(|m| m.len()).unwrap_or(0);
+        assert!(partial_bytes > 0, "unfinalised fMP4 should have flushed bytes, got 0");
+
+        let corrupt = sub.join("CapShotX_corrupt.mp4.partial");
+        std::fs::write(&corrupt, b"not a valid mp4 container").unwrap();
+
+        let recovered = recover_partials(&dir);
+        assert_eq!(recovered.len(), 1, "expected 1 recovered file, got {recovered:?}");
+        assert!(recovered[0].ends_with("CapShotX_crash (recovered).mp4"));
+        assert!(!partial.exists());
+        assert!(corrupt.exists(), "corrupt partial must never be deleted");
+        assert!(media::poster_frame(&recovered[0]).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn instant_stop_produces_valid_mp4() {
+        let dir = std::env::temp_dir().join(format!("capshotx-instant-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mon = platform_windows::monitors::enumerate().into_iter().next().unwrap();
+        let b = mon.bounds;
+        let area = platform_windows::monitors::PixelRect {
+            left: b.left,
+            top: b.top,
+            right: (b.left + 320).min(b.right),
+            bottom: (b.top + 180).min(b.bottom),
+        };
+        let out = dir.join("2026-10").join("Video").join("instant.mp4");
+        let rec = Recorder::start(Settings {
+            target: Target::Area(area),
+            fps: 30,
+            quality: VideoQuality::Compact,
+            cursor: false,
+            desktop: None,
+            microphone: None,
+            output: out,
+        })
+        .expect("start");
+        let summary = rec.stop().expect("instant stop must still write at least one frame");
+        assert!(summary.frames_written >= 1);
+        let info = media::probe(&summary.path).expect("probe");
+        assert!(info.has_video && info.duration > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

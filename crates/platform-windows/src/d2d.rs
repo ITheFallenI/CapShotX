@@ -12,7 +12,7 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_FEATURE_LEVEL_DEFAULT, D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS, D2D1_PRESENT_OPTIONS_IMMEDIATELY,
     D2D1_PRESENT_OPTIONS_NONE,
     D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
-    D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1RenderTarget,
+    D2D1CreateFactory, ID2D1Bitmap, ID2D1DCRenderTarget, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1RenderTarget,
     ID2D1SolidColorBrush,
 };
 use windows::Win32::Graphics::DirectWrite::{
@@ -56,6 +56,22 @@ impl Factories {
     /// where waiting for each vblank in turn makes tracking lag).
     pub fn hwnd_target_immediate(&self, hwnd: HWND, size: (u32, u32), dpi: f32) -> Result<ID2D1HwndRenderTarget> {
         self.hwnd_target_with(hwnd, size, dpi, D2D1_PRESENT_OPTIONS_IMMEDIATELY)
+    }
+
+    /// A premultiplied-alpha GDI DC render target (for `UpdateLayeredWindow`
+    /// per-pixel alpha overlays).
+    pub fn dc_target(&self, dpi: f32) -> Result<ID2D1DCRenderTarget> {
+        // SAFETY: descriptor is fully initialised.
+        unsafe {
+            self.d2d.CreateDCRenderTarget(&D2D1_RENDER_TARGET_PROPERTIES {
+                r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                pixelFormat: pixel_format(D2D1_ALPHA_MODE_PREMULTIPLIED),
+                dpiX: dpi,
+                dpiY: dpi,
+                usage: D2D1_RENDER_TARGET_USAGE_NONE,
+                minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
+            })
+        }
     }
 
     fn hwnd_target_with(

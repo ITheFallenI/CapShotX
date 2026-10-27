@@ -1,17 +1,20 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
 
 use platform_windows::popup_menu::{
-    MenuEntry, MenuHeader, MenuTheme, RgbaImage, show_popup_menu,
+    MenuEntry, MenuHeader, MenuTheme, RgbaImage, show_native_popup_menu, show_popup_menu,
 };
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
-use crate::commands::AppCommand;
+use crate::commands::{Action, AppCommand, Waker};
 
 const MENU_OPEN: &str = "open";
+const MENU_CAPTURE_REGION: &str = "capture_region";
+const MENU_CAPTURE_WINDOW: &str = "capture_window";
+const MENU_CAPTURE_MONITOR: &str = "capture_monitor";
 const MENU_SETTINGS: &str = "settings";
 const MENU_QUIT: &str = "quit";
 const MENU_RECORD: &str = "record";
+const MENU_RECORD_FAST: &str = "record_fast";
 
 /// A recording is starting, running or saving (menu shows "Stop").
 static RECORDING: AtomicBool = AtomicBool::new(false);
@@ -57,19 +60,18 @@ fn recording_rgba() -> Vec<u8> {
     px
 }
 
-/// Creates the tray icon. Must be called on the UI thread after the event loop starts.
+/// Creates the tray icon on the main thread. Works both in pure tray mode
+/// (no `eframe` window or GPU device loaded) and while the UI window is open.
 ///
 /// Right-click opens CapShotX's own popup menu; left-click is forwarded as
 /// [`AppCommand::TrayLeftClick`] so the app can apply the user's preference.
-pub fn install(ctx: egui::Context, tx: Sender<AppCommand>) -> anyhow::Result<Tray> {
+pub fn install(waker: Waker) -> anyhow::Result<Tray> {
     let icon = tray_icon::Icon::from_rgba(crate::icon::rgba(32), 32, 32)?;
     let tray = TrayIconBuilder::new()
         .with_tooltip("CapShotX")
         .with_icon(icon)
         .build()?;
 
-    // The handler runs inside the UI thread's Win32 message loop, even while
-    // the window is hidden; request_repaint wakes App::logic to drain the channel.
     TrayIconEvent::set_event_handler(Some(move |event| {
         let TrayIconEvent::Click {
             button,
@@ -80,8 +82,8 @@ pub fn install(ctx: egui::Context, tx: Sender<AppCommand>) -> anyhow::Result<Tra
             return;
         };
         match button {
-            MouseButton::Left => send(&ctx, &tx, AppCommand::TrayLeftClick),
-            MouseButton::Right => show_menu(&ctx, &tx),
+            MouseButton::Left => waker.send(AppCommand::TrayLeftClick),
+            MouseButton::Right => show_menu(&waker),
             MouseButton::Middle => {}
         }
     }));
@@ -89,43 +91,83 @@ pub fn install(ctx: egui::Context, tx: Sender<AppCommand>) -> anyhow::Result<Tra
     Ok(Tray { icon: tray })
 }
 
-fn send(ctx: &egui::Context, tx: &Sender<AppCommand>, cmd: AppCommand) {
-    let _ = tx.send(cmd);
-    ctx.request_repaint();
-}
-
-fn show_menu(ctx: &egui::Context, tx: &Sender<AppCommand>) {
-    let header = MenuHeader {
-        title: "CapShotX".into(),
-        subtitle: if RECORDING.load(Ordering::Relaxed) { "Recording…".into() } else { "Running in the tray".into() },
-        icon: Some(RgbaImage {
-            rgba: crate::icon::rgba(64),
-            width: 64,
-            height: 64,
-        }),
-    };
-    let entries = vec![
+fn show_menu(waker: &Waker) {
+    let is_recording = RECORDING.load(Ordering::Relaxed);
+    let mut entries = vec![
         MenuEntry::item(MENU_OPEN, "Open CapShotX"),
-        MenuEntry::item(MENU_RECORD, if RECORDING.load(Ordering::Relaxed) { "Stop recording" } else { "Record screen" }),
+        MenuEntry::Separator,
+        MenuEntry::item(MENU_CAPTURE_REGION, "Capture region"),
+        MenuEntry::item(MENU_CAPTURE_WINDOW, "Capture window"),
+        MenuEntry::item(MENU_CAPTURE_MONITOR, "Capture display"),
+        MenuEntry::Separator,
+    ];
+    if is_recording {
+        entries.push(MenuEntry::item(MENU_RECORD, "Stop recording"));
+    } else {
+        entries.push(MenuEntry::item(MENU_RECORD, "Record screen"));
+        entries.push(MenuEntry::item(MENU_RECORD_FAST, "Fast record"));
+    }
+    entries.extend([
+        MenuEntry::Separator,
         MenuEntry::item(MENU_SETTINGS, "Settings"),
         MenuEntry::Separator,
         MenuEntry::item(MENU_QUIT, "Quit CapShotX"),
-    ];
+    ]);
     let theme = MenuTheme {
-        dark: ctx.theme() == egui::Theme::Dark,
+        dark: waker.is_dark(),
     };
+    let use_native = waker.low_memory_mode();
 
-    let (ctx, tx) = (ctx.clone(), tx.clone());
-    let result = show_popup_menu(Some(header), entries, theme, move |id| {
+    let waker = waker.clone();
+    let on_select = move |id: &str| {
+        if let Some(action) = match id {
+            MENU_CAPTURE_REGION => Some(Action::CaptureRegion),
+            MENU_CAPTURE_WINDOW => Some(Action::CaptureWindow),
+            MENU_CAPTURE_MONITOR => Some(Action::CaptureMonitor),
+            _ => None,
+        } {
+            let waker = waker.clone();
+            std::thread::spawn(move || {
+                // Let the tray popup menu finish its DWM fade-out before freezing the desktop.
+                std::thread::sleep(std::time::Duration::from_millis(85));
+                waker.send(AppCommand::Hotkey(action));
+            });
+            return;
+        }
         let cmd = match id {
             MENU_OPEN => AppCommand::Open,
             MENU_SETTINGS => AppCommand::OpenSettings,
             MENU_QUIT => AppCommand::Quit,
-            MENU_RECORD => AppCommand::RecordToggle,
+            MENU_RECORD if is_recording => AppCommand::RecordToggle,
+            MENU_RECORD => AppCommand::RecordStart { fast: false, from_app: false },
+            MENU_RECORD_FAST => AppCommand::RecordStart { fast: true, from_app: false },
             _ => return,
         };
-        send(&ctx, &tx, cmd);
-    });
+        waker.send(cmd);
+    };
+
+    let result = if use_native {
+        let mut opened_ui = false;
+        let res = show_native_popup_menu(entries, theme, |id| {
+            opened_ui = matches!(id, MENU_OPEN | MENU_SETTINGS);
+            on_select(id);
+        });
+        if !opened_ui && !RECORDING.load(Ordering::Relaxed) {
+            platform_windows::shell::trim_working_set();
+        }
+        res
+    } else {
+        let header = MenuHeader {
+            title: "CapShotX".into(),
+            subtitle: if is_recording { "Recording…".into() } else { "Running in the tray".into() },
+            icon: Some(RgbaImage {
+                rgba: crate::icon::rgba(64),
+                width: 64,
+                height: 64,
+            }),
+        };
+        show_popup_menu(Some(header), entries, theme, on_select)
+    };
     if let Err(err) = result {
         tracing::error!("could not show tray menu: {err}");
     }

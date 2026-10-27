@@ -17,7 +17,7 @@ fn main() {
         let started = Instant::now();
         let first = &entries[..30.min(entries.len())];
         for e in first.iter().rev() {
-            thumbs.request(e.key());
+            thumbs.request(e.key(), pass == "cold" && gallery::is_video(&e.path));
         }
         for _ in first {
             rx.recv().unwrap();

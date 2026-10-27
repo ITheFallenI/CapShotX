@@ -12,6 +12,9 @@ use std::collections::VecDeque;
 pub const RATE: u32 = 48_000;
 /// 20 ms.
 pub const RESYNC_FRAMES: i64 = 960;
+/// Maximum unmixed buffer per source (10 s) so anomalous timestamp jumps
+/// never allocate unbounded silence (REC-05).
+pub const MAX_BUFFER_FRAMES: i64 = RATE as i64 * 10;
 
 #[derive(Default)]
 struct Track {
@@ -34,6 +37,7 @@ pub struct Mixer {
     tracks: Vec<Track>,
     /// Frames already mixed and handed out.
     written: i64,
+    muted: bool,
     pub resyncs: u32,
 }
 
@@ -42,6 +46,7 @@ impl Mixer {
         Self {
             tracks: (0..sources).map(|_| Track { gain: 1.0, ..Default::default() }).collect(),
             written: 0,
+            muted: false,
             resyncs: 0,
         }
     }
@@ -52,6 +57,14 @@ impl Mixer {
 
     pub fn set_gain(&mut self, source: usize, gain: f32) {
         self.tracks[source].gain = gain;
+    }
+
+    pub fn set_muted(&mut self, muted: bool) {
+        self.muted = muted;
+    }
+
+    pub fn is_muted(&self) -> bool {
+        self.muted
     }
 
     /// Adds audio from `source` whose first frame belongs at timeline frame
@@ -65,6 +78,7 @@ impl Mixer {
             return;
         }
 
+        let pos = pos.min(self.written + MAX_BUFFER_FRAMES);
         let mut at = match t.next {
             Some(next) if (next - pos).abs() <= RESYNC_FRAMES => next,
             Some(_) => {
@@ -72,7 +86,8 @@ impl Mixer {
                 pos
             }
             None => pos,
-        };
+        }
+        .min(self.written + MAX_BUFFER_FRAMES);
         t.next = Some(at + frames);
 
         // Already mixed (very late packet): drop what's behind us.
@@ -97,23 +112,31 @@ impl Mixer {
             }
         } else if at > t.end() {
             // Gap: keep the buffer contiguous with explicit silence.
-            let gap = ((at - t.end()) * 2) as usize;
+            let gap = ((at - t.end()).min(MAX_BUFFER_FRAMES) * 2) as usize;
             t.buf.extend(std::iter::repeat_n(0.0, gap));
         }
         t.buf.extend(data.iter().copied());
+        let max_samples = ((MAX_BUFFER_FRAMES as usize) + (frames as usize)) * 2;
+        if t.buf.len() > max_samples {
+            let excess_frames = (t.buf.len() - max_samples) / 2;
+            t.buf.drain(..excess_frames * 2);
+            t.start += excess_frames as i64;
+        }
     }
 
     /// Mixes timeline frames `[written, end)` into 16-bit stereo PCM.
     pub fn mix_until(&mut self, end: i64) -> Vec<i16> {
         let count = (end - self.written).max(0);
         let mut mix = vec![0.0f32; (count * 2) as usize];
+        let mute_scale = if self.muted { 0.0 } else { 1.0 };
         for t in &mut self.tracks {
+            let gain = t.gain * mute_scale;
             for f in 0..count {
                 let frame = self.written + f;
                 if frame >= t.start && frame < t.end() {
                     let i = ((frame - t.start) * 2) as usize;
-                    mix[(f * 2) as usize] += t.buf[i] * t.gain;
-                    mix[(f * 2 + 1) as usize] += t.buf[i + 1] * t.gain;
+                    mix[(f * 2) as usize] += t.buf[i] * gain;
+                    mix[(f * 2 + 1) as usize] += t.buf[i + 1] * gain;
                 }
             }
             // Drop consumed frames.
@@ -251,5 +274,24 @@ mod tests {
         let pcm = m.mix_until(48_000);
         let filled = pcm.chunks(2).filter(|f| f[0] > 16_000 && f[1] > 16_000).count();
         assert!((47_900..=48_000).contains(&filled), "filled {filled}");
+    }
+
+    #[test]
+    fn mute_preserves_gain_and_caps_huge_gaps() {
+        let mut m = Mixer::new(1);
+        m.set_gain(0, 0.5);
+        m.set_muted(true);
+        m.push(0, 0, &tone(480, 0.8), RATE, 2);
+        let muted_pcm = m.mix_until(480);
+        assert!(muted_pcm.iter().all(|&s| s == 0), "muted output must be silent");
+
+        m.set_muted(false);
+        m.push(0, 480, &tone(480, 0.8), RATE, 2);
+        let live_pcm = m.mix_until(960);
+        assert!((live_pcm[0] as f32 / 32767.0 - 0.4).abs() < 0.02, "configured gain restored");
+
+        // Anomalous 1-hour timestamp jump must remain bounded.
+        m.push(0, RATE as i64 * 3600, &tone(480, 0.5), RATE, 2);
+        assert!(m.tracks[0].buf.len() <= (MAX_BUFFER_FRAMES as usize + 480) * 2);
     }
 }

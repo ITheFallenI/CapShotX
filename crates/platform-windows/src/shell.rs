@@ -1,19 +1,36 @@
-//! Shell helpers: local time, opening files, Recycle Bin, folder picker.
+//! Shell helpers: local time, opening files, Recycle Bin, folder picker,
+//! process initialisation, elevation, tray message pumping and working-set trimming.
 
+use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, LPARAM, POINT, SYSTEMTIME, WPARAM};
+use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
+use windows::Win32::System::Memory::{GetProcessHeap, HEAP_FLAGS, HeapCompact};
+use windows::Win32::System::Ole::OleInitialize;
+use windows::Win32::System::ProcessStatus::{
+    K32EmptyWorkingSet, K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+};
+use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::System::SystemInformation::GetLocalTime;
+use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentThreadId, OpenProcessToken};
 use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+use windows::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+};
 use windows::Win32::UI::Shell::{
     FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOS_FORCEFILESYSTEM,
     FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog, IShellItem, SHCreateItemFromParsingName,
-    SHFILEOPSTRUCTW, SHFileOperationW, SIGDN_FILESYSPATH, ShellExecuteW,
+    SHELLEXECUTEINFOW, SHFILEOPSTRUCTW, SHFileOperationW, SIGDN_FILESYSPATH, ShellExecuteExW,
+    ShellExecuteW,
 };
-use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+use windows::Win32::UI::WindowsAndMessaging::{
+    DispatchMessageW, GetCursorPos, GetMessagePos, GetMessageW, MSG, PM_REMOVE, PeekMessageW,
+    PostThreadMessageW, SW_SHOWNORMAL, TranslateMessage, WM_NULL, WM_QUIT,
+};
 use windows::core::{HSTRING, PCWSTR, w};
 
 /// Local wall-clock time.
@@ -125,5 +142,182 @@ pub fn pick_folder(initial: Option<&Path>) -> Option<PathBuf> {
         let path = name.to_string().ok();
         CoTaskMemFree(Some(name.0 as *const _));
         path.map(PathBuf::from)
+    }
+}
+
+/// Screen cursor coordinates `(x, y)`, falling back to `GetMessagePos` if UIPI
+/// blocks `GetCursorPos` while an elevated window has focus.
+pub fn cursor_pos() -> (i32, i32) {
+    let mut pt = POINT::default();
+    // SAFETY: valid out-pointer; GetMessagePos has no preconditions.
+    unsafe {
+        if GetCursorPos(&mut pt).is_ok() {
+            (pt.x, pt.y)
+        } else {
+            let packed = GetMessagePos();
+            ((packed & 0xffff) as i16 as i32, ((packed >> 16) & 0xffff) as i16 as i32)
+        }
+    }
+}
+
+/// Returns `true` when this process holds an elevated (Administrator / High IL) token.
+pub fn is_elevated() -> bool {
+    // SAFETY: queries TokenElevation on the current process token and closes the handle.
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut ret_len = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut elevation as *mut _ as *mut c_void),
+            size_of::<TOKEN_ELEVATION>() as u32,
+            &mut ret_len,
+        )
+        .is_ok();
+        let _ = CloseHandle(token);
+        ok && elevation.TokenIsElevated != 0
+    }
+}
+
+/// Spawns a new instance of the current executable with Administrator privileges
+/// (`ShellExecuteExW` `"runas"`). Returns `Err` if the UAC prompt is cancelled.
+pub fn relaunch_as_admin(args: &[&str]) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe failed: {e}"))?;
+    let file = HSTRING::from(exe.as_os_str());
+    let joined = args
+        .iter()
+        .map(|a| {
+            if a.contains(' ') || a.contains('"') {
+                format!("\"{}\"", a.replace('"', "\\\""))
+            } else {
+                (*a).to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let params = HSTRING::from(joined);
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        lpVerb: w!("runas"),
+        lpFile: PCWSTR(file.as_ptr()),
+        lpParameters: if args.is_empty() { PCWSTR::null() } else { PCWSTR(params.as_ptr()) },
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    // SAFETY: `file` and `params` outlive the synchronous ShellExecuteExW call.
+    unsafe { ShellExecuteExW(&mut info).map_err(|e| e.message()) }
+}
+
+/// Sets Per-Monitor V2 DPI awareness and apartment COM on the main thread
+/// before any hidden tray or single-instance window is created, so starting
+/// straight to the tray behaves identically to opening the UI immediately.
+pub fn init_process() {
+    // SAFETY: both calls have no pointer preconditions and harmlessly report
+    // an error if already set on this process/thread.
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        let _ = OleInitialize(None);
+    }
+}
+
+/// OS identifier of the calling thread, for [`wake_thread`].
+pub fn current_thread_id() -> u32 {
+    // SAFETY: GetCurrentThreadId has no preconditions.
+    unsafe { GetCurrentThreadId() }
+}
+
+/// Posts a harmless `WM_NULL` to wake a thread blocked in [`pump_messages_once`].
+pub fn wake_thread(thread_id: u32) {
+    // SAFETY: posting WM_NULL to a thread ID is safe even if it has no queue yet.
+    unsafe {
+        let _ = PostThreadMessageW(thread_id, WM_NULL, WPARAM(0), LPARAM(0));
+    }
+}
+
+/// Sleeps until at least one Win32 message arrives on this thread, then
+/// dispatches all queued messages (tray icon clicks, popup menu events,
+/// `TaskbarCreated`, wakeups). Returns `false` only on `WM_QUIT`.
+pub fn pump_messages_once() -> bool {
+    // SAFETY: standard Win32 message pump on the owning thread's queue.
+    unsafe {
+        let mut msg = MSG::default();
+        if GetMessageW(&mut msg, None, 0, 0).0 <= 0 {
+            return false;
+        }
+        let _ = TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+            if msg.message == WM_QUIT {
+                return false;
+            }
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        true
+    }
+}
+
+/// Whether Windows is currently set to Dark app mode.
+pub fn system_prefers_dark() -> bool {
+    let mut light: u32 = 0;
+    let mut size = size_of::<u32>() as u32;
+    // SAFETY: `light` and `size` outlive the synchronous registry read.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"),
+            w!("AppsUseLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut light as *mut u32 as *mut c_void),
+            Some(&mut size),
+        )
+    };
+    if status.is_ok() { light == 0 } else { true }
+}
+
+/// Compacts the process heap and asks Windows to reclaim unused pages from the
+/// working set (e.g. after closing the UI window to the tray or finishing a
+/// capture). Active pages fault softly back from RAM if touched again.
+pub fn trim_working_set() {
+    // SAFETY: operates on the current process and its default heap.
+    unsafe {
+        if let Ok(heap) = GetProcessHeap() {
+            let _ = HeapCompact(heap, HEAP_FLAGS(0));
+        }
+        let _ = K32EmptyWorkingSet(GetCurrentProcess());
+    }
+}
+
+/// Current resident working set of this process in bytes, if queryable.
+pub fn working_set_bytes() -> Option<usize> {
+    let mut pmc = PROCESS_MEMORY_COUNTERS {
+        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `pmc` is valid and `cb` matches its exact byte size.
+    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, pmc.cb).ok().ok()? };
+    Some(pmc.WorkingSetSize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wake_and_pump_and_trim_work() {
+        let tid = current_thread_id();
+        assert_ne!(tid, 0);
+        assert!(working_set_bytes().unwrap_or(0) > 0);
+        let _ = system_prefers_dark();
+        let _ = is_elevated();
+        let _ = cursor_pos();
+        wake_thread(tid);
+        assert!(pump_messages_once());
+        trim_working_set();
     }
 }

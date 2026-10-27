@@ -12,18 +12,59 @@ use egui::{
 use gallery::{Entry, ThumbKey, Thumbnailer};
 use platform_windows::shell;
 
+use crate::screen_record::format_duration;
 use crate::theme::semibold;
 use crate::widgets::{self, Icon, palette};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MediaFilter {
+    #[default]
+    All,
+    Images,
+    Videos,
+}
+
+impl MediaFilter {
+    fn matches(self, path: &Path) -> bool {
+        match self {
+            Self::All => true,
+            Self::Images => !gallery::is_video(path),
+            Self::Videos => gallery::is_video(path),
+        }
+    }
+}
+
+/// Lightweight metadata kept in memory while the UI window is closed to the
+/// tray (~a few KB, zero pixel or GPU data) so reopening Home/Gallery is instant.
+pub struct GalleryCache {
+    pub entries: Vec<Entry>,
+    pub durations: HashMap<PathBuf, Duration>,
+    pub filter: MediaFilter,
+    pub newest_first: bool,
+    pub dirty: bool,
+}
+
+impl Default for GalleryCache {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            durations: HashMap::new(),
+            filter: MediaFilter::All,
+            newest_first: true,
+            dirty: true,
+        }
+    }
+}
+
 const RESCAN_EVERY: Duration = Duration::from_secs(10);
-/// Thumbnail textures kept in memory (~230 KB each at 320×180).
-const MAX_TEXTURES: usize = 120;
+/// Thumbnail textures kept in GPU memory (~230 KB each at 320×180).
+const MAX_TEXTURES: usize = 48;
 const MIN_TILE: f32 = 210.0;
 const GAP: f32 = 14.0;
 const TILE_FOOTER: f32 = 46.0;
 const HEADER_H: f32 = 40.0;
 const NOTICE_FOR: Duration = Duration::from_secs(3);
-const PREVIEW_MAX_SIDE: u32 = 8192;
+const PREVIEW_MAX_SIDE: u32 = 3840;
 
 enum Slot {
     Pending,
@@ -35,7 +76,7 @@ struct Preview {
     path: PathBuf,
     texture: Option<TextureHandle>,
     error: Option<String>,
-    loading: Option<Receiver<Result<(u32, u32, Vec<u8>), String>>>,
+    loading: Option<Receiver<(Result<(u32, u32, Vec<u8>), String>, Option<Duration>)>>,
 }
 
 struct Rename {
@@ -70,10 +111,12 @@ pub struct GalleryView {
     scanned_at: Option<Instant>,
     rescan_pending: bool,
     thumbs: HashMap<ThumbKey, Slot>,
+    durations: HashMap<PathBuf, Duration>,
     thumbnailer: Thumbnailer,
     frame: u64,
     wanted: HashSet<ThumbKey>,
     search: String,
+    filter: MediaFilter,
     newest_first: bool,
     preview: Option<Preview>,
     rename: Option<Rename>,
@@ -82,34 +125,63 @@ pub struct GalleryView {
 }
 
 impl GalleryView {
-    pub fn new(ctx: &egui::Context, folder: PathBuf, cache_dir: Option<PathBuf>) -> Self {
+    pub fn new(
+        ctx: &egui::Context,
+        folder: PathBuf,
+        cache_dir: Option<PathBuf>,
+        cache: &mut GalleryCache,
+    ) -> Self {
         let repaint = ctx.clone();
+        let has_cached = !cache.entries.is_empty() && !cache.dirty;
         let mut view = Self {
             ctx: ctx.clone(),
             folder,
-            entries: Vec::new(),
+            entries: std::mem::take(&mut cache.entries),
             scan: None,
-            scanned_at: None,
+            scanned_at: has_cached.then(Instant::now),
             rescan_pending: false,
             thumbs: HashMap::new(),
+            durations: std::mem::take(&mut cache.durations),
             thumbnailer: Thumbnailer::new(cache_dir, move || repaint.request_repaint()),
             frame: 0,
             wanted: HashSet::new(),
             search: String::new(),
-            newest_first: true,
+            filter: cache.filter,
+            newest_first: cache.newest_first,
             preview: None,
             rename: None,
             notice: None,
             jobs: mpsc::channel(),
         };
-        view.request_rescan();
+        if !has_cached {
+            view.request_rescan();
+        }
         view
+    }
+
+    /// Saves lightweight index metadata back to `cache` and drops GPU textures
+    /// before closing the window to the tray.
+    pub fn save_cache(&mut self, cache: &mut GalleryCache) {
+        self.preview = None;
+        self.thumbs.clear();
+        cache.entries = std::mem::take(&mut self.entries);
+        cache.durations = std::mem::take(&mut self.durations);
+        cache.filter = self.filter;
+        cache.newest_first = self.newest_first;
+        cache.dirty = self.scan.is_some() || self.rescan_pending;
+    }
+
+    /// Frees any full-resolution preview texture when leaving the Gallery page.
+    pub fn release_preview(&mut self) {
+        self.preview = None;
     }
 
     pub fn set_folder(&mut self, folder: PathBuf) {
         if folder != self.folder {
             self.folder = folder;
             self.entries.clear();
+            self.durations.clear();
+            self.thumbs.clear();
             self.preview = None;
             self.request_rescan();
         }
@@ -151,6 +223,9 @@ impl GalleryView {
         }
 
         for thumb in self.thumbnailer.poll() {
+            if let Some(dur) = thumb.duration {
+                self.durations.insert(thumb.key.path.clone(), dur);
+            }
             let slot = match thumb.image {
                 Ok((w, h, rgba)) => {
                     let image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
@@ -172,9 +247,12 @@ impl GalleryView {
 
         if let Some(preview) = &mut self.preview
             && let Some(rx) = &preview.loading
-            && let Ok(result) = rx.try_recv()
+            && let Ok((result, dur)) = rx.try_recv()
         {
             preview.loading = None;
+            if let Some(d) = dur {
+                self.durations.insert(preview.path.clone(), d);
+            }
             match result {
                 Ok((w, h, rgba)) => {
                     let image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
@@ -219,56 +297,6 @@ impl GalleryView {
         self.ctx.request_repaint_after(NOTICE_FOR);
     }
 
-    // ----- Home ------------------------------------------------------------
-
-    /// The newest captures as up to two rows of tiles. Returns true if the
-    /// user wants the full gallery (View all, or a tile opened a preview).
-    pub fn recent_ui(&mut self, ui: &mut Ui) -> bool {
-        let p = palette(ui);
-        let mut open_gallery = false;
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("RECENT CAPTURES").font(semibold(11.5)).color(p.muted));
-            if !self.entries.is_empty() {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let text = RichText::new(format!("View all ({}) →", self.entries.len())).size(13.0).color(p.accent);
-                    if ui.add(egui::Button::new(text).frame(false)).clicked() {
-                        open_gallery = true;
-                    }
-                });
-            }
-        });
-
-        if self.entries.is_empty() {
-            self.empty_state(ui, "No captures yet", "Screenshots you take will appear here.");
-            return open_gallery;
-        }
-
-        let width = ui.available_width();
-        let (cols, tile_w, tile_h) = grid_metrics(width);
-        let shown: Vec<usize> = (0..self.entries.len().min(cols * 2)).collect();
-        let rows = shown.len().div_ceil(cols);
-        let (area, _) = ui.allocate_exact_size(vec2(width, rows as f32 * (tile_h + GAP) - GAP), Sense::hover());
-        let mut action = None;
-        for (n, &i) in shown.iter().enumerate() {
-            let (row, col) = (n / cols, n % cols);
-            let rect = Rect::from_min_size(
-                area.min + vec2(col as f32 * (tile_w + GAP), row as f32 * (tile_h + GAP)),
-                vec2(tile_w, tile_h),
-            );
-            if let Some(a) = self.tile(ui, rect, i) {
-                action = Some(a);
-            }
-        }
-        self.finish_frame();
-        if let Some(action) = action {
-            open_gallery |= matches!(action, TileAction::Preview(_));
-            self.apply(action);
-        }
-        self.rename_dialog(ui.ctx());
-        open_gallery
-    }
-
     // ----- Gallery page ----------------------------------------------------
 
     pub fn page_ui(&mut self, ui: &mut Ui) {
@@ -301,7 +329,16 @@ impl GalleryView {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.search)
                         .hint_text("Search file names")
-                        .desired_width(220.0),
+                        .desired_width(185.0),
+                );
+                widgets::segmented(
+                    ui,
+                    &mut self.filter,
+                    &[
+                        (MediaFilter::All, "All"),
+                        (MediaFilter::Images, "Images"),
+                        (MediaFilter::Videos, "Videos"),
+                    ],
                 );
             });
         });
@@ -309,7 +346,10 @@ impl GalleryView {
 
         let needle = self.search.trim().to_lowercase();
         let mut order: Vec<usize> = (0..self.entries.len())
-            .filter(|&i| needle.is_empty() || self.entries[i].name.to_lowercase().contains(&needle))
+            .filter(|&i| {
+                let e = &self.entries[i];
+                self.filter.matches(&e.path) && (needle.is_empty() || e.name.to_lowercase().contains(&needle))
+            })
             .collect();
         if !self.newest_first {
             order.reverse();
@@ -317,9 +357,9 @@ impl GalleryView {
 
         if order.is_empty() {
             if self.entries.is_empty() {
-                self.empty_state(ui, "No captures yet", "Press Ctrl+Shift+2 to take your first screenshot.");
+                self.empty_state(ui, "No captures yet", "Press Ctrl+Shift+2 for a screenshot or Ctrl+Shift+5 to record.");
             } else {
-                self.empty_state(ui, "No matches", "Try a different part of the file name.");
+                self.empty_state(ui, "No matches", "Try changing the media filter or file-name search.");
             }
             self.notice_ui(ui);
             return;
@@ -485,8 +525,9 @@ impl GalleryView {
             }
             None => {
                 painter.rect_filled(image_rect, egui::CornerRadius { nw: 12, ne: 12, sw: 0, se: 0 }, p.control);
+                let need_duration = gallery::is_video(&path) && !self.durations.contains_key(&path);
                 self.thumbs.insert(key.clone(), Slot::Pending);
-                self.thumbnailer.request(key.clone());
+                self.thumbnailer.request(key.clone(), need_duration);
             }
         }
         self.wanted.insert(key);
@@ -497,6 +538,19 @@ impl GalleryView {
             painter.circle_filled(c, 18.0, Color32::from_black_alpha(140));
             let tri = vec![pos2(c.x - 5.0, c.y - 8.0), pos2(c.x - 5.0, c.y + 8.0), pos2(c.x + 9.0, c.y)];
             painter.add(egui::Shape::convex_polygon(tri, Color32::WHITE, Stroke::NONE));
+
+            if let Some(&dur) = self.durations.get(&path) {
+                let text = format_duration(dur);
+                let font = semibold(11.5);
+                let galley = painter.layout_no_wrap(text, font, Color32::WHITE);
+                let pill_size = galley.size() + vec2(12.0, 6.0);
+                let pill_rect = Rect::from_min_size(
+                    image_rect.max - pill_size - vec2(8.0, 8.0),
+                    pill_size,
+                );
+                painter.rect_filled(pill_rect, 6, Color32::from_black_alpha(185));
+                painter.galley(pill_rect.center() - galley.size() / 2.0, galley, Color32::WHITE);
+            }
         }
 
         let entry = &self.entries[index];
@@ -561,9 +615,11 @@ impl GalleryView {
 
     fn open_preview(&mut self, path: PathBuf) {
         let (tx, rx) = mpsc::channel();
+        let known_dur = self.durations.get(&path).copied();
         let (p, ctx) = (path.clone(), self.ctx.clone());
         std::thread::spawn(move || {
-            let _ = tx.send(gallery::load_full(&p, PREVIEW_MAX_SIDE));
+            let dur = known_dur.or_else(|| gallery::video_duration(&p));
+            let _ = tx.send((gallery::load_full(&p, PREVIEW_MAX_SIDE), dur));
             ctx.request_repaint();
         });
         self.preview = Some(Preview { path, texture: None, error: None, loading: Some(rx) });
@@ -576,7 +632,7 @@ impl GalleryView {
         let order: Vec<&Entry> = self
             .entries
             .iter()
-            .filter(|e| needle.is_empty() || e.name.to_lowercase().contains(&needle))
+            .filter(|e| self.filter.matches(&e.path) && (needle.is_empty() || e.name.to_lowercase().contains(&needle)))
             .collect();
         let pos = order.iter().position(|e| e.path == path)? as isize;
         order.get((pos + step) as usize).filter(|_| pos + step >= 0).map(|e| e.path.clone())
@@ -586,8 +642,10 @@ impl GalleryView {
         let p = palette(ui);
         let Some(preview) = &self.preview else { return };
         let path = preview.path.clone();
+        let video = gallery::is_video(&path);
         let entry = self.entries.iter().find(|e| e.path == path).cloned();
         let texture_size = preview.texture.as_ref().map(|t| t.size());
+        let duration = self.durations.get(&path).copied();
         let mut close = false;
         let mut action = None;
 
@@ -602,8 +660,9 @@ impl GalleryView {
                 ui.label(RichText::new(name).font(semibold(15.0)).color(p.text));
                 if let Some(e) = &entry {
                     let size = texture_size.map_or(String::new(), |[w, h]| format!("{w} × {h} · "));
+                    let dur_str = duration.map_or(String::new(), |d| format!("{} · ", format_duration(d)));
                     ui.label(
-                        RichText::new(format!("{}{} · {}", size, gallery::day_label(&e.local), gallery::human_size(e.size)))
+                        RichText::new(format!("{size}{dur_str}{} · {}", gallery::day_label(&e.local), gallery::human_size(e.size)))
                             .size(12.5)
                             .color(p.muted),
                     );
@@ -618,7 +677,6 @@ impl GalleryView {
                 if ui.button("Show in Explorer").clicked() {
                     shell::reveal(&path);
                 }
-                let video = gallery::is_video(&path);
                 if !video && ui.button("Copy image").clicked() {
                     self.copy_image(path.clone());
                 }
@@ -633,14 +691,30 @@ impl GalleryView {
         let response = ui.allocate_rect(area, Sense::click());
         ui.painter().rect_filled(area, 12, p.control);
         let preview = self.preview.as_ref().expect("checked above");
+        let mut play_clicked = false;
         if let Some(texture) = &preview.texture {
             let [w, h] = texture.size();
             let fit = (area.width() / w as f32).min(area.height() / h as f32).min(1.0);
             let size = vec2(w as f32 * fit, h as f32 * fit);
             let rect = Rect::from_center_size(area.center(), size);
             egui::Image::new((texture.id(), size)).paint_at(ui, rect);
+            if video {
+                let c = rect.center();
+                let play_rect = Rect::from_center_size(c, vec2(72.0, 72.0));
+                let play_resp = ui
+                    .interact(play_rect, Id::unique("preview-video-play"), Sense::click())
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                let alpha = if play_resp.hovered() { 185 } else { 145 };
+                ui.painter().circle_filled(c, 28.0, Color32::from_black_alpha(alpha));
+                let tri = vec![pos2(c.x - 7.0, c.y - 11.0), pos2(c.x - 7.0, c.y + 11.0), pos2(c.x + 12.0, c.y)];
+                ui.painter().add(egui::Shape::convex_polygon(tri, Color32::WHITE, Stroke::NONE));
+                if play_resp.clicked() {
+                    play_clicked = true;
+                }
+            }
         } else if let Some(err) = &preview.error {
-            ui.painter().text(area.center(), Align2::CENTER_CENTER, format!("Can't open this image: {err}"), FontId::proportional(14.0), p.danger);
+            let prefix = if video { "Can't preview this video" } else { "Can't open this image" };
+            ui.painter().text(area.center(), Align2::CENTER_CENTER, format!("{prefix}: {err}"), FontId::proportional(14.0), p.danger);
         } else {
             ui.painter().text(area.center(), Align2::CENTER_CENTER, "Loading…", FontId::proportional(14.0), p.muted);
         }
@@ -673,6 +747,9 @@ impl GalleryView {
                 if i.key_pressed(Key::ArrowRight) {
                     go = go.clone().or(next.clone());
                 }
+                if video && (i.key_pressed(Key::Enter) || i.key_pressed(Key::Space)) {
+                    play_clicked = true;
+                }
                 if i.key_pressed(Key::Escape) {
                     close = true;
                 }
@@ -680,6 +757,9 @@ impl GalleryView {
                     action = Some(TileAction::Delete(path.clone()));
                 }
             });
+        }
+        if play_clicked {
+            shell::open(&path);
         }
 
         if close {
@@ -735,6 +815,9 @@ impl GalleryView {
                         && preview.path == old
                     {
                         preview.path = new_path.clone();
+                    }
+                    if let Some(dur) = self.durations.remove(&old) {
+                        self.durations.insert(new_path.clone(), dur);
                     }
                     if let Some(e) = self.entries.iter_mut().find(|e| e.path == old) {
                         e.name = new_path.file_name().unwrap_or_default().to_string_lossy().into_owned();

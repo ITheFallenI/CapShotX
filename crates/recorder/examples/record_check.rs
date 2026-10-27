@@ -61,6 +61,7 @@ fn main() {
     let rec = Recorder::start(Settings {
         target: Target::Area(area),
         fps: 30,
+        quality: recorder::VideoQuality::Balanced,
         cursor: true,
         desktop: Some(AudioInput { device_id: None, gain: 1.0 }),
         microphone: mic.then_some(AudioInput { device_id: None, gain: 1.0 }),

@@ -11,7 +11,7 @@ use windows::core::w;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let has = |a: &str| args.iter().any(|x| x == a);
-    let (warn, paused) = (has("warn"), has("paused"));
+    let (warn, paused, muted) = (has("warn"), has("paused"), has("muted"));
     let start = Instant::now();
     let _bar = RecordingToolbar::show(
         (100, 100),
@@ -21,6 +21,7 @@ fn main() {
             ToolbarStatus {
                 elapsed: Duration::from_secs(83) + start.elapsed(),
                 paused,
+                muted,
                 level: Some(((t * 7.0).sin() * 0.5 + 0.5) * 0.6),
                 warning: warn.then(|| "Microphone: \"Headset\" was disconnected at 1:12".into()),
                 countdown: None,
