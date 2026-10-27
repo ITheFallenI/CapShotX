@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = ["crates/app", "crates/capture", "crates/gallery", "crates/media", "crates/platform-windows", "crates/recorder"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+eframe = { version = "0.37", default-features = false, features = ["wgpu", "default_fonts", "accesskit"] }
+egui = "0.37"
+tray-icon = "0.26"
+windows = "0.62"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+anyhow = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

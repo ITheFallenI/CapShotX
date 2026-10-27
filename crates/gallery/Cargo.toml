@@ -1,0 +1,11 @@
+[package]
+name = "gallery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "webp"] }
+media = { path = "../media" }
+platform-windows = { path = "../platform-windows" }
+tracing.workspace = true
