@@ -1,5 +1,7 @@
 param(
     [switch]$Offline,
+    [switch]$BumpMinor,
+    [switch]$CommitAndPush,
     [switch]$PublishRelease,
     [string]$ReleaseNotes = ""
 )
@@ -8,7 +10,32 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 Push-Location $RepoRoot
 
+$cargoTomlPath = Join-Path $RepoRoot "Cargo.toml"
+$originalCargoToml = $null
+$buildSucceeded = $false
+
 try {
+    if ($BumpMinor) {
+        $originalCargoToml = Get-Content $cargoTomlPath -Raw
+        if ($originalCargoToml -match '(?m)^version\s*=\s*"(\d+)\.(\d+)\.(\d+)"') {
+            $major = [int]$Matches[1]
+            $minor = [int]$Matches[2] + 1
+            $patch = 0
+            $oldVer = "$($Matches[1]).$($Matches[2]).$($Matches[3])"
+            $newVer = "$major.$minor.$patch"
+            $updatedToml = [regex]::Replace(
+                $originalCargoToml,
+                '(?m)^version\s*=\s*"\d+\.\d+\.\d+"',
+                "version = `"$newVer`"",
+                1
+            )
+            [System.IO.File]::WriteAllText($cargoTomlPath, $updatedToml, [System.Text.UTF8Encoding]::new($false))
+            Write-Host "[0/3] Bumped version in Cargo.toml: $oldVer -> $newVer" -ForegroundColor Yellow
+        } else {
+            throw "Could not find 'version = `"X.Y.Z`"' in Cargo.toml"
+        }
+    }
+
     $cargoFlags = @()
     if ($Offline -or $env:CARGO_NET_OFFLINE -eq "true") {
         $cargoFlags += "--offline"
@@ -68,15 +95,30 @@ try {
     Write-Host "[3/3] Packaging complete!" -ForegroundColor Green
     Write-Host "  Installer : $distSetup ($setupMb MB)"
     Write-Host "  Portable  : $distPortable ($appMb MB)"
+    $buildSucceeded = $true
+
+    $cargoToml = Get-Content $cargoTomlPath -Raw
+    if ($cargoToml -match '(?m)^version\s*=\s*"([^"]+)"') {
+        $ver = $Matches[1]
+    } else {
+        throw "Could not parse version from Cargo.toml"
+    }
+    $tag = "v$ver"
+
+    if ($CommitAndPush) {
+        Write-Host "Committing and pushing $tag to GitHub..." -ForegroundColor Cyan
+        & git add -A
+        if ($LASTEXITCODE -ne 0) { throw "git add failed" }
+        $status = & git status --porcelain
+        if (-not [string]::IsNullOrWhiteSpace(($status -join ""))) {
+            & git commit -m "Release $tag"
+            if ($LASTEXITCODE -ne 0) { throw "git commit failed" }
+        }
+        & git push origin main
+        if ($LASTEXITCODE -ne 0) { throw "git push failed" }
+    }
 
     if ($PublishRelease) {
-        $cargoToml = Get-Content (Join-Path $RepoRoot "Cargo.toml") -Raw
-        if ($cargoToml -match '(?m)^version\s*=\s*"([^"]+)"') {
-            $ver = $Matches[1]
-        } else {
-            throw "Could not parse version from Cargo.toml"
-        }
-        $tag = "v$ver"
         $setupAsset = "$distSetup#CapShotX-Setup.exe (Windows Installer)"
         $portableAsset = "$distPortable#CapShotX.exe (Portable)"
 
@@ -97,6 +139,10 @@ try {
         }
     }
 } finally {
+    if ($BumpMinor -and -not $buildSucceeded -and $null -ne $originalCargoToml) {
+        [System.IO.File]::WriteAllText($cargoTomlPath, $originalCargoToml, [System.Text.UTF8Encoding]::new($false))
+        Write-Host "Build failed; reverted version bump in Cargo.toml." -ForegroundColor Yellow
+    }
     Remove-Item Env:\CAPSHOTX_PAYLOAD_EXE -ErrorAction SilentlyContinue
     Pop-Location
 }

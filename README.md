@@ -121,8 +121,8 @@ target\release\CapShotX.exe
 # Build the standalone installer + portable bundle into dist\
 .\packaging\build-installer.ps1
 
-# Build and publish/update the GitHub Release in one step
-.\packaging\build-installer.ps1 -PublishRelease
+# Bump version (+0.1), build, commit, push, and publish a new GitHub Release in one step
+.\release-update.bat
 ```
 
 Run the tests with `cargo test --workspace`. `cargo run -p recorder --example record_check`
