@@ -36,7 +36,9 @@ pub enum CaptureMode {
 pub enum AfterCapture {
     Copy,
     CopyAndSave,
-    /// Keep the selection adjustable and show Copy / Save buttons.
+    /// Open the screenshot directly in the CapShotX Image Editor.
+    Edit,
+    /// Keep the selection adjustable and show Copy / Edit / Save buttons.
     Ask,
 }
 
@@ -49,12 +51,16 @@ pub struct CaptureOptions {
     pub file_template: String,
     /// Selection border / handle colour (sRGB).
     pub highlight: [u8; 3],
+    /// Selection border thickness in pixels at 100% scale.
+    pub border_width: u8,
     /// Play a shutter sound when a capture is taken.
     pub sound: bool,
     /// Show the confirmation toast in the bottom-right corner.
     pub show_notification: bool,
     /// Theme for the confirmation toast.
     pub dark: bool,
+    /// Whether the optional `CapShotX_Editor.exe` add-on is installed.
+    pub editor_installed: bool,
 }
 
 #[derive(Debug)]
@@ -65,6 +71,11 @@ pub enum CaptureOutcome {
         height: u32,
         copied: bool,
         saved: Option<PathBuf>,
+    },
+    Edit {
+        width: u32,
+        height: u32,
+        bgra: Vec<u8>,
     },
     ColorCopied(String),
     Failed(String),
@@ -132,7 +143,9 @@ fn session(options: CaptureOptions, on_finish: impl FnOnce(Finished)) {
             after: options.after,
             magnifier: options.magnifier,
             highlight: options.highlight,
+            border_width: options.border_width,
             purpose: Purpose::Screenshot,
+            editor_installed: options.editor_installed,
         },
     );
     // A new capture may start as soon as the overlay is gone.
@@ -174,6 +187,20 @@ fn session(options: CaptureOptions, on_finish: impl FnOnce(Finished)) {
             drop(frame);
             if options.sound {
                 platform_windows::sound::play_shutter();
+            }
+            if delivery == Delivery::Edit {
+                tracing::info!(
+                    "captured {}x{} for editor in {} ms",
+                    image.width(),
+                    image.height(),
+                    started.elapsed().as_millis()
+                );
+                on_finish(finish(CaptureOutcome::Edit {
+                    width: image.width(),
+                    height: image.height(),
+                    bgra: image.bgra,
+                }));
+                return;
             }
             match deliver(&image, delivery, &options) {
                 Ok((copied, saved)) => {
@@ -236,7 +263,7 @@ pub enum Selection {
 
 /// Shows the selection overlay for choosing a recording area. Blocks the
 /// calling thread until the user picks or cancels.
-pub fn select_area(magnifier: bool, highlight: [u8; 3]) -> Result<Selection, String> {
+pub fn select_area(magnifier: bool, highlight: [u8; 3], border_width: u8) -> Result<Selection, String> {
     if ACTIVE.swap(true, Ordering::AcqRel) {
         return Err("A capture is already in progress".into());
     }
@@ -251,7 +278,9 @@ pub fn select_area(magnifier: bool, highlight: [u8; 3]) -> Result<Selection, Str
                 after: AfterCapture::Copy,
                 magnifier,
                 highlight,
+                border_width,
                 purpose: Purpose::Record,
+                editor_installed: false,
             },
         );
         match result {

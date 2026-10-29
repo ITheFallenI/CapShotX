@@ -135,7 +135,7 @@ impl RecordPanel {
     }
 
     pub fn matches_query(query: &str) -> bool {
-        const HAYSTACK: &str = "recording before recording adjust bounds fast start video quality high balanced compact mp4 frame rate 60 fps 30 fps countdown timer record cursor mouse pointer recording outline border desktop audio system sound speakers headphones gain microphone voice input audio check test";
+        const HAYSTACK: &str = "recording before recording adjust bounds fast start video quality high balanced compact mp4 frame rate 60 fps 30 fps countdown timer record cursor mouse pointer recording outline border colour color highlight thickness width desktop audio system sound speakers headphones gain microphone voice input audio check test";
         query.is_empty() || HAYSTACK.contains(query)
     }
 
@@ -231,6 +231,23 @@ impl RecordPanel {
                     widgets::toggle(ui, &mut r.show_outline);
                 },
             );
+        }
+        if show("recording outline border colour color highlight") {
+            sep(ui, &mut any);
+            widgets::setting_row(ui, "Recording colour", "Area picker, bounds and outline while recording", |ui| {
+                egui::widgets::color_picker::color_edit_button_srgb(ui, &mut r.highlight);
+                for preset in crate::settings::HIGHLIGHT_PRESETS.iter().rev() {
+                    if widgets::swatch(ui, *preset, r.highlight == *preset).clicked() {
+                        r.highlight = *preset;
+                    }
+                }
+            });
+        }
+        if show("recording outline border thickness width") {
+            sep(ui, &mut any);
+            widgets::setting_row(ui, "Recording border thickness", "Width of the recording area border", |ui| {
+                ui.add(egui::Slider::new(&mut r.border_width, crate::settings::BORDER_WIDTH_RANGE).suffix(" px"));
+            });
         }
 
         let show_desktop = show("desktop audio system sound speakers headphones volume gain test sound");

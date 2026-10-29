@@ -2,6 +2,7 @@
 
 mod app;
 mod commands;
+mod editor_addon;
 mod gallery_view;
 mod icon;
 mod record_settings;
@@ -29,6 +30,9 @@ fn main() -> anyhow::Result<()> {
     platform_windows::shell::init_process();
 
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(res) = try_run_popout_editor(&raw_args) {
+        return res;
+    }
     let has_flag = |flag: &str| raw_args.iter().any(|a| a == flag);
     let autostart = has_flag("--autostart");
     let no_elevate = has_flag("--no-elevate");
@@ -105,6 +109,28 @@ fn main() -> anyhow::Result<()> {
 
     tracing::info!("CapShotX exited");
     Ok(())
+}
+
+/// Checks CLI arguments for pop-out Image Editor window flags (`--editor`,
+/// `--editor-paste`, `--editor-file <path>`, `--editor-bgra <path>`) and
+/// forwards them to `CapShotX_Editor.exe` if installed.
+fn try_run_popout_editor(args: &[String]) -> Option<anyhow::Result<()>> {
+    let first = args.first()?.as_str();
+    let target = match first {
+        "--editor" => editor_addon::EditorLaunchTarget::Empty,
+        "--editor-paste" => editor_addon::EditorLaunchTarget::Paste,
+        "--editor-file" => {
+            let path = args.get(1).map(std::path::PathBuf::from)?;
+            editor_addon::EditorLaunchTarget::File(path)
+        }
+        "--editor-bgra" => {
+            let path = args.get(1).map(std::path::PathBuf::from)?;
+            editor_addon::EditorLaunchTarget::TempBgra(path)
+        }
+        _ => return None,
+    };
+    let _ = editor_addon::launch_if_installed(&target);
+    Some(Ok(()))
 }
 
 fn acquire_instance(wait_restart: bool) -> anyhow::Result<Option<SingleInstance>> {

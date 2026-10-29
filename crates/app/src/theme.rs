@@ -124,8 +124,8 @@ fn visuals(p: Palette, mut v: Visuals) -> Visuals {
     v
 }
 
-/// Uses Segoe UI when available, keeping egui's bundled fonts as fallbacks
-/// (they provide the symbol glyphs).
+/// Uses Segoe UI when available, keeping egui's bundled fonts and Segoe UI
+/// Symbol as fallbacks for symbol glyphs.
 fn install_fonts(ctx: &Context) {
     let mut fonts = FontDefinitions::default();
     let dir = std::env::var_os("WINDIR")
@@ -146,8 +146,12 @@ fn install_fonts(ctx: &Context) {
     };
     let has_regular = load("segoe-ui", "segoeui.ttf");
     let has_semibold = load("segoe-ui-semibold", "seguisb.ttf");
+    let has_symbols = load("segoe-ui-symbol", "seguisym.ttf");
 
     let proportional = fonts.families.entry(FontFamily::Proportional).or_default();
+    if has_symbols {
+        proportional.insert(0, "segoe-ui-symbol".to_owned());
+    }
     if has_regular {
         proportional.insert(0, "segoe-ui".to_owned());
     }

@@ -84,6 +84,7 @@ pub enum AfterCapture {
     Copy,
     #[default]
     CopyAndSave,
+    Edit,
     Ask,
 }
 
@@ -92,6 +93,7 @@ impl From<AfterCapture> for capture::AfterCapture {
         match value {
             AfterCapture::Copy => Self::Copy,
             AfterCapture::CopyAndSave => Self::CopyAndSave,
+            AfterCapture::Edit => Self::Edit,
             AfterCapture::Ask => Self::Ask,
         }
     }
@@ -107,11 +109,24 @@ pub struct CaptureSettings {
     pub file_template: String,
     /// Selection highlight colour (sRGB).
     pub highlight: [u8; 3],
+    /// Selection border thickness in pixels (1–40) at 100% scale.
+    pub border_width: u8,
     pub sound: bool,
     pub show_notification: bool,
 }
 
 pub const DEFAULT_HIGHLIGHT: [u8; 3] = [110, 123, 255];
+pub const DEFAULT_BORDER_WIDTH: u8 = 2;
+/// Quick picks for highlight colours; the first is the CapShotX accent.
+pub const HIGHLIGHT_PRESETS: [[u8; 3]; 6] = [
+    DEFAULT_HIGHLIGHT,
+    [14, 165, 233],
+    [16, 185, 129],
+    [245, 158, 11],
+    [239, 68, 68],
+    [236, 72, 153],
+];
+pub const BORDER_WIDTH_RANGE: std::ops::RangeInclusive<u8> = 1..=40;
 
 impl Default for CaptureSettings {
     fn default() -> Self {
@@ -121,6 +136,7 @@ impl Default for CaptureSettings {
             save_folder: None,
             file_template: capture::DEFAULT_FILE_TEMPLATE.to_owned(),
             highlight: DEFAULT_HIGHLIGHT,
+            border_width: DEFAULT_BORDER_WIDTH,
             sound: true,
             show_notification: true,
         }
@@ -177,6 +193,11 @@ pub struct RecordSettings {
     pub cursor: bool,
     /// Show a capture-excluded border around the live recorded area.
     pub show_outline: bool,
+    /// Area picker, bounds and live outline colour (sRGB), independent of
+    /// the screenshot highlight.
+    pub highlight: [u8; 3],
+    /// Area picker, bounds and live outline thickness in pixels at 100% scale.
+    pub border_width: u8,
     pub desktop_audio: bool,
     /// `None` = follow the Windows default output.
     pub desktop_device: Option<String>,
@@ -197,6 +218,8 @@ impl Default for RecordSettings {
             quality: VideoQuality::default(),
             cursor: true,
             show_outline: true,
+            highlight: DEFAULT_HIGHLIGHT,
+            border_width: DEFAULT_BORDER_WIDTH,
             desktop_audio: true,
             desktop_device: None,
             desktop_gain: 1.0,
@@ -205,6 +228,23 @@ impl Default for RecordSettings {
             microphone_gain: 1.0,
             countdown: 3,
         }
+    }
+}
+
+/// Which sidebar pages are listed. Settings is always shown so the others
+/// can be turned back on.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SidebarSettings {
+    pub home: bool,
+    pub gallery: bool,
+    pub addons: bool,
+    pub editor: bool,
+}
+
+impl Default for SidebarSettings {
+    fn default() -> Self {
+        Self { home: true, gallery: true, addons: false, editor: true }
     }
 }
 
@@ -223,6 +263,7 @@ pub struct Settings {
     pub shortcuts: BTreeMap<Action, String>,
     pub capture: CaptureSettings,
     pub record: RecordSettings,
+    pub sidebar: SidebarSettings,
 }
 
 impl Default for Settings {
@@ -239,6 +280,7 @@ impl Default for Settings {
             shortcuts: BTreeMap::new(),
             capture: CaptureSettings::default(),
             record: RecordSettings::default(),
+            sidebar: SidebarSettings::default(),
         }
     }
 }
@@ -298,6 +340,8 @@ impl Settings {
         if capture::LEGACY_DEFAULT_FILE_TEMPLATES.contains(&self.capture.file_template.as_str()) {
             self.capture.file_template = capture::DEFAULT_FILE_TEMPLATE.to_owned();
         }
+        self.capture.border_width = self.capture.border_width.clamp(*BORDER_WIDTH_RANGE.start(), *BORDER_WIDTH_RANGE.end());
+        self.record.border_width = self.record.border_width.clamp(*BORDER_WIDTH_RANGE.start(), *BORDER_WIDTH_RANGE.end());
         self.record.desktop_gain = self.record.desktop_gain.clamp(0.0, 2.0);
         self.record.microphone_gain = self.record.microphone_gain.clamp(0.0, 2.0);
     }
@@ -329,6 +373,7 @@ mod tests {
         let mut s: Settings = serde_json::from_str(raw).unwrap();
         s.migrate();
         assert_eq!(s.capture.file_template, capture::DEFAULT_FILE_TEMPLATE);
+        assert_eq!(s.capture.border_width, DEFAULT_BORDER_WIDTH);
         assert!(s.launch_at_startup);
         assert!(s.low_memory_mode);
         assert!(!s.run_as_admin);
@@ -337,6 +382,7 @@ mod tests {
         assert_eq!(s.record.start_mode, RecordStartMode::ConfirmBounds);
         assert_eq!(s.record.quality, VideoQuality::Balanced);
         assert!(s.record.show_outline);
+        assert_eq!(s.sidebar, SidebarSettings::default());
         assert_eq!(s.record.desktop_gain, 1.0);
         assert_eq!(s.record.microphone_gain, 1.0);
     }

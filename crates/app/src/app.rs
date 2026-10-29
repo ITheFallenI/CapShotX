@@ -11,6 +11,7 @@ use platform_windows::monitors::{self, Monitor};
 use platform_windows::single_instance::SingleInstance;
 
 use crate::commands::{Action, AppCommand, Waker};
+use crate::editor_addon::{self, EditorLaunchTarget};
 use crate::gallery_view::{GalleryCache, GalleryView};
 use crate::record_settings::RecordPanel;
 use crate::screen_record::ScreenRecorder;
@@ -19,15 +20,6 @@ use crate::theme::{self, semibold};
 use crate::tray::{self, Tray};
 use crate::widgets::{self, Icon, palette};
 
-/// Quick picks for the capture highlight; the first is the CapShotX accent.
-const HIGHLIGHT_PRESETS: [[u8; 3]; 6] = [
-    crate::settings::DEFAULT_HIGHLIGHT,
-    [14, 165, 233],
-    [16, 185, 129],
-    [245, 158, 11],
-    [239, 68, 68],
-    [236, 72, 153],
-];
 const MONITOR_REFRESH: Duration = Duration::from_secs(2);
 /// Time for the main window to disappear before freezing the screen.
 const HIDE_BEFORE_CAPTURE: Duration = Duration::from_millis(250);
@@ -36,6 +28,7 @@ const HIDE_BEFORE_CAPTURE: Duration = Duration::from_millis(250);
 pub(crate) enum Page {
     Home,
     Gallery,
+    Addons,
     Settings,
 }
 
@@ -85,6 +78,15 @@ pub(crate) enum UpdateState {
     Error(String),
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum EditorAddonState {
+    #[default]
+    Idle,
+    PromptOpen,
+    Downloading,
+    Error(String),
+}
+
 /// Persistent lightweight process state (~a few KB) that lives across UI
 /// sessions while CapShotX sits in the tray with zero GPU/renderer overhead.
 pub struct CoreState {
@@ -98,6 +100,8 @@ pub struct CoreState {
     pub(crate) page: Page,
     pub(crate) settings_tab: SettingsTab,
     pub(crate) update_state: UpdateState,
+    pub(crate) editor_addon_state: EditorAddonState,
+    pub(crate) pending_editor_target: Option<EditorLaunchTarget>,
     pub window_size: [f32; 2],
     pub window_pos_px: Option<[f32; 2]>,
     pub window_maximized: bool,
@@ -172,15 +176,25 @@ impl CoreState {
         let check_on_startup = settings.check_updates_on_startup;
         let mut core = Self {
             saved_settings: settings.clone(),
+            page: if settings.sidebar.home {
+                Page::Home
+            } else if settings.sidebar.gallery {
+                Page::Gallery
+            } else if settings.sidebar.addons {
+                Page::Addons
+            } else {
+                Page::Settings
+            },
             settings,
             settings_error: None,
             startup_error: None,
             is_elevated: platform_windows::shell::is_elevated(),
             sync_startup_enabled,
             last_saved_folder: None,
-            page: Page::Home,
             settings_tab: SettingsTab::General,
             update_state: UpdateState::Idle,
+            editor_addon_state: EditorAddonState::Idle,
+            pending_editor_target: None,
             window_size: [1040.0, 680.0],
             window_pos_px: None,
             window_maximized: false,
@@ -258,6 +272,71 @@ impl CoreState {
         }
     }
 
+    /// Launches `CapShotX_Editor.exe` with `target` if installed. If not installed yet,
+    /// records `target` as pending, opens the one-click download prompt, and returns `false`
+    /// so the caller can show the main window.
+    pub fn request_editor(&mut self, target: EditorLaunchTarget) -> bool {
+        if editor_addon::launch_if_installed(&target) {
+            self.pending_editor_target = None;
+            return true;
+        }
+        if let Some(EditorLaunchTarget::TempBgra(old_temp)) =
+            self.pending_editor_target.replace(target)
+        {
+            let _ = std::fs::remove_file(old_temp);
+        }
+        if !matches!(self.editor_addon_state, EditorAddonState::Downloading) {
+            self.editor_addon_state = EditorAddonState::PromptOpen;
+        }
+        false
+    }
+
+    pub fn start_editor_download(&mut self) {
+        if matches!(self.editor_addon_state, EditorAddonState::Downloading) {
+            return;
+        }
+        let Some(target_path) = editor_addon::editor_exe_path() else {
+            self.editor_addon_state = EditorAddonState::Error(
+                "Could not determine install path for CapShotX_Editor.exe".into(),
+            );
+            return;
+        };
+        self.editor_addon_state = EditorAddonState::Downloading;
+        let waker = self.waker.clone();
+        let _ = std::thread::Builder::new()
+            .name("editor-download".into())
+            .spawn(move || {
+                let res = platform_windows::updater::download_and_install_editor(&target_path);
+                waker.send(AppCommand::EditorInstallFinished(res));
+            });
+    }
+
+    pub fn cancel_editor_prompt(&mut self) {
+        if let Some(EditorLaunchTarget::TempBgra(temp)) = self.pending_editor_target.take() {
+            let _ = std::fs::remove_file(temp);
+        }
+        self.editor_addon_state = EditorAddonState::Idle;
+    }
+
+    fn on_editor_install_finished(&mut self, res: Result<String, String>) -> bool {
+        match res {
+            Ok(version) => {
+                tracing::info!("CapShotX_Editor.exe v{version} installed");
+                self.editor_addon_state = EditorAddonState::Idle;
+                self.apply_shortcut(Action::CaptureEdit);
+                if let Some(target) = self.pending_editor_target.take() {
+                    return editor_addon::launch_if_installed(&target);
+                }
+                false
+            }
+            Err(err) => {
+                tracing::warn!("CapShotX_Editor.exe download failed: {err}");
+                self.editor_addon_state = EditorAddonState::Error(err);
+                false
+            }
+        }
+    }
+
     fn sync_startup(&mut self) {
         if !self.sync_startup_enabled {
             return;
@@ -322,6 +401,12 @@ impl CoreState {
                     TrayLeftClick::Nothing => {}
                 },
                 AppCommand::Open => return TrayStep::OpenWindow,
+                AppCommand::OpenEditor => {
+                    if !self.request_editor(EditorLaunchTarget::Empty) {
+                        return TrayStep::OpenWindow;
+                    }
+                    self.trim_if_idle();
+                }
                 AppCommand::OpenSettings => {
                     self.page = Page::Settings;
                     return TrayStep::OpenWindow;
@@ -373,11 +458,16 @@ impl CoreState {
                     self.trim_if_idle();
                 }
                 AppCommand::CaptureFinished { finished, restore_window } => {
-                    if self.finish_capture_state(finished) {
+                    let (saved, opened_editor) = self.finish_capture_state(finished);
+                    if saved {
                         self.gallery_cache.dirty = true;
                     }
                     self.persist_settings_headless();
-                    if restore_window && !self.quit_after_saving {
+                    let need_prompt = matches!(
+                        self.editor_addon_state,
+                        EditorAddonState::PromptOpen | EditorAddonState::Downloading | EditorAddonState::Error(_)
+                    );
+                    if (restore_window || need_prompt) && !opened_editor && !self.quit_after_saving {
                         return TrayStep::OpenWindow;
                     }
                     self.trim_if_idle();
@@ -393,6 +483,10 @@ impl CoreState {
                     tracing::warn!("update install failed: {err}");
                     self.update_state = UpdateState::Error(err);
                 }
+                AppCommand::EditorInstallFinished(res) => {
+                    self.on_editor_install_finished(res);
+                    self.trim_if_idle();
+                }
             }
         }
         TrayStep::StayInTray
@@ -403,6 +497,12 @@ impl CoreState {
         match action {
             Action::OpenApp => {}
             Action::CaptureRegion => self.start_capture_headless(capture::CaptureMode::Region),
+            Action::CaptureEdit => {
+                self.start_capture_headless_with_after(
+                    capture::CaptureMode::Region,
+                    capture::AfterCapture::Edit,
+                );
+            }
             Action::CaptureWindow => self.start_capture_headless(capture::CaptureMode::Window),
             Action::CaptureMonitor => self.start_capture_headless(capture::CaptureMode::Monitor),
             Action::RecordToggle => self.toggle_screen_recording(),
@@ -432,14 +532,26 @@ impl CoreState {
             save_folder: c.save_folder(),
             file_template: c.file_template.clone(),
             highlight: c.highlight,
+            border_width: c.border_width,
             sound: c.sound,
             show_notification: c.show_notification,
             dark: self.waker.is_dark(),
+            editor_installed: editor_addon::is_installed(),
         }
     }
 
     fn start_capture_headless(&mut self, mode: capture::CaptureMode) {
-        let options = self.capture_options(mode);
+        let after = self.settings.capture.after.into();
+        self.start_capture_headless_with_after(mode, after);
+    }
+
+    fn start_capture_headless_with_after(
+        &mut self,
+        mode: capture::CaptureMode,
+        after: capture::AfterCapture,
+    ) {
+        let mut options = self.capture_options(mode);
+        options.after = after;
         let waker = self.waker.clone();
         let on_finish = move |finished| {
             waker.send(AppCommand::CaptureFinished { finished, restore_window: false });
@@ -449,26 +561,41 @@ impl CoreState {
         }
     }
 
-    /// Updates magnifier preference from a finished capture; returns `true` if
-    /// an image was saved to disk.
-    fn finish_capture_state(&mut self, finished: capture::Finished) -> bool {
-        match &finished.outcome {
+    /// Updates magnifier preference from a finished capture; returns `(saved, open_editor)`.
+    fn finish_capture_state(&mut self, finished: capture::Finished) -> (bool, bool) {
+        let mut saved = false;
+        let mut open_editor = false;
+        match finished.outcome {
             capture::CaptureOutcome::Failed(err) => tracing::warn!("capture failed: {err}"),
+            capture::CaptureOutcome::Captured {
+                saved: Some(path), ..
+            } => {
+                self.last_saved_folder = path.parent().map(std::path::Path::to_path_buf);
+                saved = true;
+            }
+            capture::CaptureOutcome::Edit {
+                width,
+                height,
+                bgra,
+            } => {
+                let target = editor_addon::write_temp_bgra(width, height, &bgra)
+                    .map_or(EditorLaunchTarget::Empty, EditorLaunchTarget::TempBgra);
+                open_editor = self.request_editor(target);
+            }
             outcome => tracing::debug!("capture finished: {outcome:?}"),
         }
-        let saved = if let capture::CaptureOutcome::Captured { saved: Some(path), .. } = &finished.outcome {
-            self.last_saved_folder = path.parent().map(std::path::Path::to_path_buf);
-            true
-        } else {
-            false
-        };
         self.settings.capture.magnifier = finished.magnifier;
-        saved
+        (saved, open_editor)
     }
 
     /// (Re-)registers the global shortcut for `action` from settings.
     fn apply_shortcut(&mut self, action: Action) {
         let id = action.hotkey_id();
+        if action == Action::CaptureEdit && !editor_addon::is_installed() {
+            self.hotkeys.unregister(id);
+            self.shortcut_status.insert(action, ShortcutStatus::Disabled);
+            return;
+        }
         let text = self.settings.shortcut(action);
         let status = if text.is_empty() {
             self.hotkeys.unregister(id);
@@ -584,6 +711,14 @@ impl<'a> CapShotApp<'a> {
         match action {
             Action::OpenApp => self.show_window(ctx),
             Action::CaptureRegion => self.start_capture(ctx, capture::CaptureMode::Region, false),
+            Action::CaptureEdit => {
+                self.start_capture_with_after(
+                    ctx,
+                    capture::CaptureMode::Region,
+                    capture::AfterCapture::Edit,
+                    false,
+                );
+            }
             Action::CaptureWindow => self.start_capture(ctx, capture::CaptureMode::Window, false),
             Action::CaptureMonitor => self.start_capture(ctx, capture::CaptureMode::Monitor, false),
             Action::RecordToggle => self.core.toggle_screen_recording(),
@@ -595,7 +730,19 @@ impl<'a> CapShotApp<'a> {
     /// Opens the capture overlay. From the Home page the main window is
     /// hidden first (and restored afterwards) so it isn't in the shot.
     fn start_capture(&mut self, ctx: &egui::Context, mode: capture::CaptureMode, from_app: bool) {
-        let options = self.core.capture_options(mode);
+        let after = self.core.settings.capture.after.into();
+        self.start_capture_with_after(ctx, mode, after, from_app);
+    }
+
+    fn start_capture_with_after(
+        &mut self,
+        ctx: &egui::Context,
+        mode: capture::CaptureMode,
+        after: capture::AfterCapture,
+        from_app: bool,
+    ) {
+        let mut options = self.core.capture_options(mode);
+        options.after = after;
         let waker = self.core.waker.clone();
         let on_finish = move |finished| {
             waker.send(AppCommand::CaptureFinished { finished, restore_window: from_app });
@@ -616,10 +763,15 @@ impl<'a> CapShotApp<'a> {
     }
 
     fn on_capture_finished(&mut self, ctx: &egui::Context, finished: capture::Finished, restore: bool) {
-        if self.core.finish_capture_state(finished) {
+        let (saved, opened_editor) = self.core.finish_capture_state(finished);
+        if saved {
             self.gallery.request_rescan();
         }
-        if restore {
+        let need_prompt = matches!(
+            self.core.editor_addon_state,
+            EditorAddonState::PromptOpen | EditorAddonState::Downloading | EditorAddonState::Error(_)
+        );
+        if (restore && !opened_editor) || need_prompt {
             self.show_window(ctx);
         }
     }
@@ -795,15 +947,25 @@ impl<'a> CapShotApp<'a> {
         ui.add_space(22.0);
 
         ui.spacing_mut().item_spacing.y = 4.0;
-        for (page, icon, label) in [
-            (Page::Home, Icon::Home, "Home"),
-            (Page::Gallery, Icon::Image, "Gallery"),
-            (Page::Settings, Icon::Settings, "Settings"),
+        let shown = self.core.settings.sidebar.clone();
+        for (page, icon, label, visible) in [
+            (Page::Home, Icon::Home, "Home", shown.home),
+            (Page::Gallery, Icon::Image, "Gallery", shown.gallery),
+            (Page::Addons, Icon::Addons, "Add-ons", shown.addons),
+            (Page::Settings, Icon::Settings, "Settings", true),
         ] {
-            if widgets::nav_item(ui, icon, label, self.core.page == page).clicked() && self.core.page != page {
+            if visible
+                && widgets::nav_item(ui, icon, label, self.core.page == page).clicked() && self.core.page != page {
                 self.stop_recording();
                 self.core.page = page;
             }
+        }
+        if shown.editor
+            && editor_addon::is_installed()
+            && widgets::nav_item(ui, Icon::Edit, "Editor ↗", false).clicked()
+        {
+            self.stop_recording();
+            self.core.request_editor(EditorLaunchTarget::Empty);
         }
     }
 
@@ -866,8 +1028,17 @@ impl<'a> CapShotApp<'a> {
 
     fn home(&mut self, ui: &mut Ui) {
         let p = palette(ui);
+        let editor_installed = editor_addon::is_installed();
         ui.label(RichText::new("Home").font(semibold(26.0)).color(p.text));
-        ui.label(RichText::new("Capture. Edit. Record.").size(14.0).color(p.muted));
+        ui.label(
+            RichText::new(if editor_installed {
+                "Capture. Edit. Record."
+            } else {
+                "Capture. Record."
+            })
+            .size(14.0)
+            .color(p.muted),
+        );
         ui.add_space(18.0);
 
         widgets::section_label(ui, "Capture");
@@ -906,6 +1077,70 @@ impl<'a> CapShotApp<'a> {
         });
         if let Some(mode) = start {
             self.start_capture(ui.ctx(), mode, true);
+        }
+
+        if editor_installed {
+            ui.add_space(18.0);
+            widgets::section_label(ui, "Edit");
+            let edit_sc = self.core.settings.shortcut(Action::CaptureEdit).to_owned();
+            let mut edit_action: Option<u8> = None; // 0 = capture & edit, 1 = open file, 2 = paste
+            ui.columns(3, |cols| {
+                let r0 = widgets::action_card(&mut cols[0], |ui| {
+                    widgets::icon_tile(ui, Icon::Edit, 38.0);
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Capture & edit").font(semibold(15.5)).color(p.text));
+                    ui.label(RichText::new("Take a screenshot and open it in the Editor").size(13.0).color(p.muted));
+                    ui.add_space(4.0);
+                    shortcut_footer(ui, &edit_sc);
+                });
+                if r0.clicked() {
+                    edit_action = Some(0);
+                }
+
+                let r1 = widgets::action_card(&mut cols[1], |ui| {
+                    widgets::icon_tile(ui, Icon::Image, 38.0);
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Open image").font(semibold(15.5)).color(p.text));
+                    ui.label(RichText::new("Annotate, crop, redact, or frame an existing image").size(13.0).color(p.muted));
+                    ui.add_space(4.0);
+                    shortcut_footer(ui, "Ctrl+O");
+                });
+                if r1.clicked() {
+                    edit_action = Some(1);
+                }
+
+                let r2 = widgets::action_card(&mut cols[2], |ui| {
+                    widgets::icon_tile(ui, Icon::Edit, 38.0);
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Paste into Editor").font(semibold(15.5)).color(p.text));
+                    ui.label(RichText::new("Edit an image currently on your clipboard").size(13.0).color(p.muted));
+                    ui.add_space(4.0);
+                    shortcut_footer(ui, "Ctrl+V");
+                });
+                if r2.clicked() {
+                    edit_action = Some(2);
+                }
+            });
+            match edit_action {
+                Some(0) => {
+                    self.start_capture_with_after(
+                        ui.ctx(),
+                        capture::CaptureMode::Region,
+                        capture::AfterCapture::Edit,
+                        true,
+                    );
+                }
+                Some(1) => {
+                    let dir = self.core.settings.capture.save_folder();
+                    if let Some(path) = platform_windows::shell::pick_open_image(Some(&dir)) {
+                        self.core.request_editor(editor_addon::target_for_path(&path));
+                    }
+                }
+                Some(2) => {
+                    self.core.request_editor(EditorLaunchTarget::Paste);
+                }
+                _ => {}
+            }
         }
 
         ui.add_space(18.0);
@@ -982,15 +1217,30 @@ impl<'a> CapShotApp<'a> {
         }
     }
 
+    fn addons_page(&mut self, ui: &mut Ui) {
+        let p = palette(ui);
+        ui.label(RichText::new("Add-ons").font(semibold(26.0)).color(p.text));
+        ui.label(
+            RichText::new("Optional tools and extensions kept separate so CapShotX stays lightweight.")
+                .size(14.0)
+                .color(p.muted),
+        );
+        ui.add_space(18.0);
+
+        widgets::section_label(ui, "Optional Add-on · Image Editor");
+        widgets::card(ui, |ui| self.editor_addon_card(ui));
+    }
+
     fn settings_page(&mut self, ui: &mut Ui) {
         let p = palette(ui);
         self.capture_shortcut(ui);
         self.refresh_monitors();
 
         let search_id = egui::Id::unique("settings-search");
-        let template_id = egui::Id::unique("capture-file-template");
+        // Type-to-search only when no input box (text field, slider value,
+        // colour hex, …) already has keyboard focus.
         if self.recording.is_none()
-            && !ui.memory(|m| m.has_focus(search_id) || m.has_focus(template_id))
+            && !ui.ctx().egui_wants_keyboard_input()
             && ui.input(|i| {
                 i.events.iter().any(|e| match e {
                     Event::Text(t) => !t.is_empty() && !t.chars().all(char::is_control),
@@ -1078,6 +1328,29 @@ impl<'a> CapShotApp<'a> {
                             &[(ThemeChoice::Dark, "Dark"), (ThemeChoice::Light, "Light"), (ThemeChoice::System, "System")],
                         );
                     });
+                });
+            }
+            if Self::sidebar_matches(&query) {
+                space_section(ui, &mut any_section);
+                widgets::section_label(ui, "Sidebar");
+                let s = &mut self.core.settings.sidebar;
+                widgets::card(ui, |ui| {
+                    let rows: [(&str, &str, &mut bool); 4] = [
+                        ("Home", "Quick capture and record actions", &mut s.home),
+                        ("Gallery", "Browse your screenshots and recordings", &mut s.gallery),
+                        ("Add-ons", "Optional downloads such as the Image Editor", &mut s.addons),
+                        ("Editor", "Opens the Image Editor when the add-on is installed", &mut s.editor),
+                    ];
+                    for (i, (title, desc, on)) in rows.into_iter().enumerate() {
+                        if i > 0 {
+                            ui.separator();
+                        }
+                        widgets::setting_row(ui, title, desc, |ui| {
+                            widgets::toggle(ui, on);
+                        });
+                    }
+                    ui.separator();
+                    ui.label(RichText::new("Settings is always shown.").size(12.0).color(p.muted));
                 });
             }
         }
@@ -1172,12 +1445,17 @@ impl<'a> CapShotApp<'a> {
         q.is_empty() || H.contains(q)
     }
 
+    fn sidebar_matches(q: &str) -> bool {
+        const H: &str = "general sidebar menu navigation nav hide show pages home gallery add-ons addons editor";
+        q.is_empty() || H.contains(q)
+    }
+
     fn general_matches(q: &str) -> bool {
-        Self::window_tray_matches(q) || Self::appearance_matches(q)
+        Self::window_tray_matches(q) || Self::appearance_matches(q) || Self::sidebar_matches(q)
     }
 
     fn capture_matches(q: &str) -> bool {
-        const H: &str = "capture screenshot after capture copy save ask magnifier zoom pixel colour sound shutter click notification toast popup preview bottom-right highlight colour border save folder directory path file name template year month day date time";
+        const H: &str = "capture screenshot after capture copy save ask magnifier zoom pixel colour sound shutter click notification toast popup preview bottom-right highlight colour border thickness width save folder directory path file name template year month day date time";
         q.is_empty() || H.contains(q)
     }
 
@@ -1189,6 +1467,9 @@ impl<'a> CapShotApp<'a> {
     }
 
     fn action_matches_query(&self, action: Action, q: &str) -> bool {
+        if action == Action::CaptureEdit && !editor_addon::is_installed() {
+            return false;
+        }
         if q.is_empty() || "hotkeys shortcuts keybinds".contains(q) {
             return true;
         }
@@ -1213,7 +1494,9 @@ impl<'a> CapShotApp<'a> {
     }
 
     fn about_matches(q: &str) -> bool {
-        Self::displays_matches(q) || Self::updates_matches(q) || Self::about_card_matches(q)
+        Self::displays_matches(q)
+            || Self::updates_matches(q)
+            || Self::about_card_matches(q)
     }
 
     fn window_tray_card(&mut self, ui: &mut Ui, q: &str) {
@@ -1409,8 +1692,10 @@ impl<'a> CapShotApp<'a> {
         let mut do_install = None;
         let mut open_url = None;
 
+        let text_max_w = (ui.available_width() - 270.0).max(180.0);
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
+                ui.set_max_width(text_max_w);
                 ui.spacing_mut().item_spacing.y = 2.0;
                 ui.label(RichText::new(title).size(14.5).color(p.text));
                 ui.label(RichText::new(subtitle).size(12.5).color(sub_color));
@@ -1472,6 +1757,211 @@ impl<'a> CapShotApp<'a> {
         }
     }
 
+    fn editor_addon_card(&mut self, ui: &mut Ui) {
+        let p = palette(ui);
+        let installed = editor_addon::is_installed();
+        let size_mb = editor_addon::installed_size_bytes()
+            .map(|b| b as f64 / (1024.0 * 1024.0));
+        let downloading = matches!(self.core.editor_addon_state, EditorAddonState::Downloading);
+
+        let (title, subtitle, sub_color) = if downloading {
+            (
+                "Downloading CapShotX_Editor.exe from GitHub Releases…".to_owned(),
+                "Verifying SHA-256 digest and installing alongside CapShotX.exe.".to_owned(),
+                p.accent,
+            )
+        } else if let EditorAddonState::Error(err) = &self.core.editor_addon_state {
+            (
+                "Image Editor download failed".to_owned(),
+                err.clone(),
+                p.danger,
+            )
+        } else if installed {
+            let size_badge = size_mb
+                .map(|mb| format!(" ({mb:.1} MB)"))
+                .unwrap_or_default();
+            (
+                format!("CapShotX Image Editor — Installed{size_badge}"),
+                "Standalone pop-out editor (CapShotX_Editor.exe). Kept separate so CapShotX.exe stays ultra-lightweight.".to_owned(),
+                p.success,
+            )
+        } else {
+            (
+                "CapShotX Image Editor — Not installed (Optional add-on)".to_owned(),
+                "Download CapShotX_Editor.exe on demand from GitHub Releases whenever you want to annotate, crop, redact, or pixelate screenshots.".to_owned(),
+                p.muted,
+            )
+        };
+
+        let mut do_download = false;
+        let mut do_open = false;
+        let mut do_uninstall = false;
+
+        let reserved_right = if downloading {
+            150.0
+        } else if installed {
+            355.0
+        } else {
+            210.0
+        };
+        let text_max_w = (ui.available_width() - reserved_right).max(160.0);
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.set_max_width(text_max_w);
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.label(RichText::new(title).size(14.5).color(p.text));
+                ui.label(RichText::new(subtitle).size(12.5).color(sub_color));
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if downloading {
+                    ui.add_enabled(false, egui::Button::new("Downloading…"));
+                } else if installed {
+                    if ui
+                        .button(RichText::new("Uninstall").color(p.danger))
+                        .on_hover_text("Remove CapShotX_Editor.exe from disk")
+                        .clicked()
+                    {
+                        do_uninstall = true;
+                    }
+                    if ui
+                        .button("Reinstall / Update")
+                        .on_hover_text("Re-download the latest CapShotX_Editor.exe from GitHub Releases")
+                        .clicked()
+                    {
+                        do_download = true;
+                    }
+                    if ui.button("Open Editor").clicked() {
+                        do_open = true;
+                    }
+                } else if ui.button("Download Image Editor").clicked() {
+                    do_download = true;
+                }
+            });
+        });
+
+        if do_open {
+            self.core.request_editor(EditorLaunchTarget::Empty);
+        }
+        if do_download {
+            self.core.start_editor_download();
+        }
+        if do_uninstall {
+            match editor_addon::uninstall_editor() {
+                Ok(()) => {
+                    if self.core.settings.capture.after == AfterCapture::Edit {
+                        self.core.settings.capture.after = AfterCapture::Copy;
+                    }
+                    self.core.apply_shortcut(Action::CaptureEdit);
+                }
+                Err(err) => {
+                    self.core.editor_addon_state = EditorAddonState::Error(err);
+                }
+            }
+        }
+    }
+
+    fn editor_addon_modal(&mut self, ctx: &egui::Context) {
+        if matches!(self.core.editor_addon_state, EditorAddonState::Idle) {
+            return;
+        }
+        let downloading = matches!(self.core.editor_addon_state, EditorAddonState::Downloading);
+        if downloading {
+            ctx.request_repaint_after(Duration::from_millis(80));
+        }
+
+        let mut do_download = false;
+        let mut do_cancel = false;
+
+        egui::Window::new("Optional Add-on — Image Editor")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .fixed_size([460.0, 220.0])
+            .show(ctx, |ui| {
+                let p = palette(ui);
+                ui.spacing_mut().item_spacing.y = 8.0;
+                ui.label(
+                    RichText::new("Download the CapShotX Image Editor?")
+                        .font(semibold(17.0))
+                        .color(p.text),
+                );
+                ui.label(
+                    RichText::new(
+                        "To keep CapShotX ultra-lightweight, the full Image Editor (CapShotX_Editor.exe) is a separate optional download (~3 MB) from GitHub Releases.",
+                    )
+                    .size(13.0)
+                    .color(p.muted),
+                );
+
+                if self.core.pending_editor_target.is_some() {
+                    Frame::new()
+                        .fill(p.accent_soft)
+                        .stroke(Stroke::new(1.0, p.accent))
+                        .corner_radius(8)
+                        .inner_margin(Margin::symmetric(10, 7))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(
+                                    "Your screenshot is ready and will open automatically in the Editor as soon as the download finishes.",
+                                )
+                                .size(12.5)
+                                .color(p.accent),
+                            );
+                        });
+                }
+
+                if let EditorAddonState::Error(err) = &self.core.editor_addon_state {
+                    Frame::new()
+                        .fill(p.control)
+                        .stroke(Stroke::new(1.0, p.danger))
+                        .corner_radius(8)
+                        .inner_margin(Margin::symmetric(10, 7))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(err).size(12.0).color(p.danger));
+                        });
+                }
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if downloading {
+                        ui.add_enabled(
+                            false,
+                            egui::Button::new(
+                                RichText::new("Downloading CapShotX_Editor.exe…")
+                                    .font(semibold(13.0)),
+                            ),
+                        );
+                    } else {
+                        let btn_label = if matches!(self.core.editor_addon_state, EditorAddonState::Error(_)) {
+                            "Retry Download"
+                        } else {
+                            "Download & Open Image Editor"
+                        };
+                        let btn = egui::Button::new(
+                            RichText::new(btn_label)
+                                .font(semibold(13.0))
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(p.accent)
+                        .corner_radius(8);
+                        if ui.add(btn).clicked() {
+                            do_download = true;
+                        }
+                        if ui.button("Not now").clicked() {
+                            do_cancel = true;
+                        }
+                    }
+                });
+            });
+
+        if do_download {
+            self.core.start_editor_download();
+        }
+        if do_cancel {
+            self.core.cancel_editor_prompt();
+        }
+    }
+
     fn about_card(&self, ui: &mut Ui) {
         let p = palette(ui);
         let settings_path = Settings::path();
@@ -1516,18 +2006,35 @@ impl<'a> CapShotApp<'a> {
             *any = true;
         };
 
-        if show("after capture copy save ask") {
+        if show("after capture copy save edit ask") {
             sep(ui, &mut any);
+            let editor_installed = editor_addon::is_installed();
+            if !editor_installed && c.after == AfterCapture::Edit {
+                c.after = AfterCapture::Copy;
+            }
             widgets::setting_row(ui, "After capture", "What happens when you finish selecting", |ui| {
-                widgets::segmented(
-                    ui,
-                    &mut c.after,
-                    &[
-                        (AfterCapture::Copy, "Copy"),
-                        (AfterCapture::CopyAndSave, "Copy & save"),
-                        (AfterCapture::Ask, "Ask each time"),
-                    ],
-                );
+                if editor_installed {
+                    widgets::segmented(
+                        ui,
+                        &mut c.after,
+                        &[
+                            (AfterCapture::Copy, "Copy"),
+                            (AfterCapture::CopyAndSave, "Copy & save"),
+                            (AfterCapture::Edit, "Open in Editor"),
+                            (AfterCapture::Ask, "Ask each time"),
+                        ],
+                    );
+                } else {
+                    widgets::segmented(
+                        ui,
+                        &mut c.after,
+                        &[
+                            (AfterCapture::Copy, "Copy"),
+                            (AfterCapture::CopyAndSave, "Copy & save"),
+                            (AfterCapture::Ask, "Ask each time"),
+                        ],
+                    );
+                }
             });
         }
         if show("magnifier pixel zoom colour cursor") {
@@ -1557,13 +2064,19 @@ impl<'a> CapShotApp<'a> {
         }
         if show("highlight colour color border selection handles") {
             sep(ui, &mut any);
-            widgets::setting_row(ui, "Highlight colour", "Selection border and handles while capturing", |ui| {
+            widgets::setting_row(ui, "Highlight colour", "Screenshot selection border and handles", |ui| {
                 egui::widgets::color_picker::color_edit_button_srgb(ui, &mut c.highlight);
-                for preset in HIGHLIGHT_PRESETS.iter().rev() {
+                for preset in crate::settings::HIGHLIGHT_PRESETS.iter().rev() {
                     if widgets::swatch(ui, *preset, c.highlight == *preset).clicked() {
                         c.highlight = *preset;
                     }
                 }
+            });
+        }
+        if show("border thickness width selection outline") {
+            sep(ui, &mut any);
+            widgets::setting_row(ui, "Border thickness", "Width of the screenshot selection border", |ui| {
+                ui.add(egui::Slider::new(&mut c.border_width, crate::settings::BORDER_WIDTH_RANGE).suffix(" px"));
             });
         }
         if show("save folder directory path location pictures") {
@@ -1755,6 +2268,11 @@ impl eframe::App for CapShotApp<'_> {
                     TrayLeftClick::Nothing => {}
                 },
                 AppCommand::Open => self.show_window(ctx),
+                AppCommand::OpenEditor => {
+                    if !self.core.request_editor(EditorLaunchTarget::Empty) {
+                        self.show_window(ctx);
+                    }
+                }
                 AppCommand::OpenSettings => {
                     self.core.page = Page::Settings;
                     self.show_window(ctx);
@@ -1829,6 +2347,9 @@ impl eframe::App for CapShotApp<'_> {
                     tracing::warn!("update install failed: {err}");
                     self.core.update_state = UpdateState::Error(err);
                 }
+                AppCommand::EditorInstallFinished(res) => {
+                    self.core.on_editor_install_finished(res);
+                }
             }
         }
 
@@ -1894,7 +2415,9 @@ impl eframe::App for CapShotApp<'_> {
                 self.gallery.tick();
                 if self.core.page == Page::Gallery {
                     // The gallery scrolls (and virtualises) its own grid.
-                    self.gallery.page_ui(ui);
+                    if let Some(edit_path) = self.gallery.page_ui(ui) {
+                        self.core.request_editor(editor_addon::target_for_path(&edit_path));
+                    }
                     return;
                 }
                 egui::ScrollArea::vertical().show(ui, |ui| {
@@ -1903,11 +2426,14 @@ impl eframe::App for CapShotApp<'_> {
                         .inner_margin(Margin { right: 14, ..Margin::ZERO })
                         .show(ui, |ui| match self.core.page {
                             Page::Home => self.home(ui),
+                            Page::Addons => self.addons_page(ui),
                             Page::Settings => self.settings_page(ui),
                             Page::Gallery => {}
                         });
                 });
             });
+
+        self.editor_addon_modal(ui.ctx());
 
         if self.core.page == Page::Settings {
             // Keeps the Displays list current without a display-change hook.

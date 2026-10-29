@@ -144,6 +144,15 @@ pub fn download_and_install_update(release: &ReleaseInfo) -> Result<(), String> 
         );
     }
 
+    // If the optional `CapShotX_Editor.exe` add-on is installed next to `CapShotX.exe`,
+    // keep it updated as well (best-effort).
+    if let Some(dir) = current_exe.parent() {
+        let editor_exe = dir.join("CapShotX_Editor.exe");
+        if editor_exe.exists() {
+            let _ = download_and_install_editor(&editor_exe);
+        }
+    }
+
     std::process::Command::new(&current_exe)
         .arg("--wait-restart")
         .current_dir(current_exe.parent().unwrap_or_else(|| Path::new(".")))
@@ -151,6 +160,80 @@ pub fn download_and_install_update(release: &ReleaseInfo) -> Result<(), String> 
         .map_err(|e| format!("Updated binary installed, but relaunch failed: {e}"))?;
 
     Ok(())
+}
+
+/// Downloads the optional `CapShotX_Editor.exe` binary from the latest GitHub
+/// Release, verifies its PE header and SHA-256 digest (if published), and writes
+/// it atomically to `target_path`.
+pub fn download_and_install_editor(target_path: &Path) -> Result<String, String> {
+    let api_url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest");
+    let (download_url, expected_sha256, tag_name) = match https_get(&api_url, 2 * 1024 * 1024)
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+    {
+        Some(json) => {
+            let tag = extract_json_string(&json, "tag_name").unwrap_or_else(|| "latest".into());
+            if let Some((url, sha, _)) = find_asset(&json, "CapShotX_Editor.exe") {
+                (url, sha, tag)
+            } else {
+                (
+                    format!(
+                        "https://github.com/{GITHUB_REPO}/releases/latest/download/CapShotX_Editor.exe"
+                    ),
+                    None,
+                    tag,
+                )
+            }
+        }
+        None => (
+            format!(
+                "https://github.com/{GITHUB_REPO}/releases/latest/download/CapShotX_Editor.exe"
+            ),
+            None,
+            "latest".into(),
+        ),
+    };
+
+    let bytes = https_get(&download_url, 64 * 1024 * 1024).map_err(|e| {
+        format!("Could not download CapShotX_Editor.exe from GitHub Releases ({tag_name}): {e}")
+    })?;
+    if bytes.len() < 1024 || &bytes[..2] != b"MZ" {
+        return Err("Downloaded CapShotX_Editor.exe is not a valid Windows executable.".to_owned());
+    }
+    if let Some(expected) = &expected_sha256 {
+        let actual = sha256_hex(&bytes);
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(format!(
+                "CapShotX_Editor.exe SHA-256 verification failed (expected {expected}, got {actual})."
+            ));
+        }
+    }
+
+    if let Some(parent) = target_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let staging = staging_exe_path(target_path);
+    let old = old_exe_path(target_path);
+    let _ = std::fs::remove_file(&staging);
+    std::fs::write(&staging, &bytes)
+        .map_err(|e| format!("Could not write {}: {e}", staging.display()))?;
+
+    if target_path.exists() {
+        let _ = std::fs::remove_file(&old);
+        let _ = std::fs::rename(target_path, &old);
+    }
+    if let Err(e) = std::fs::rename(&staging, target_path) {
+        if old.exists() {
+            let _ = std::fs::rename(&old, target_path);
+        }
+        let _ = std::fs::remove_file(&staging);
+        return Err(format!(
+            "Could not install {}: {e}",
+            target_path.display()
+        ));
+    }
+    let _ = std::fs::remove_file(&old);
+    Ok(tag_name)
 }
 
 fn paths_equal(a: &Path, b: &Path) -> bool {

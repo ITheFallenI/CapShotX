@@ -53,6 +53,7 @@ pub enum Delivery {
     Copy,
     Save,
     CopyAndSave,
+    Edit,
 }
 
 pub enum OverlayResult {
@@ -81,7 +82,10 @@ pub struct OverlayOptions {
     pub after: AfterCapture,
     pub magnifier: bool,
     pub highlight: [u8; 3],
+    /// Selection border thickness in pixels at 100% scale.
+    pub border_width: u8,
     pub purpose: Purpose,
+    pub editor_installed: bool,
 }
 
 /// Runs the overlay on the calling thread until the user commits or
@@ -158,6 +162,7 @@ enum Phase {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ToolbarButton {
     Copy,
+    Edit,
     Save,
     Cancel,
 }
@@ -454,15 +459,28 @@ impl Overlay {
     }
 
     /// Toolbar container and buttons (virtual coordinates) for a selection.
-    fn toolbar(&self, r: PixelRect) -> Option<(usize, PixelRect, [(ToolbarButton, PixelRect); 3])> {
+    fn toolbar(&self, r: PixelRect) -> Option<(usize, PixelRect, Vec<(ToolbarButton, PixelRect)>)> {
         let (si, r) = self.dominant_part(r)?;
         let cx = (r.left + r.right) / 2;
         let s = &self.surfaces[si];
         let m = s.monitor.bounds;
         let px = |v: f32| (v * s.scale).round() as i32;
         let (pad, gap, h) = (px(4.0), px(10.0), px(40.0));
-        let widths = [px(84.0), px(76.0), px(40.0)];
-        let w = widths.iter().sum::<i32>() + pad * 4;
+        let specs: &[(ToolbarButton, i32)] = if self.options.editor_installed {
+            &[
+                (ToolbarButton::Copy, px(78.0)),
+                (ToolbarButton::Edit, px(68.0)),
+                (ToolbarButton::Save, px(72.0)),
+                (ToolbarButton::Cancel, px(40.0)),
+            ]
+        } else {
+            &[
+                (ToolbarButton::Copy, px(78.0)),
+                (ToolbarButton::Save, px(72.0)),
+                (ToolbarButton::Cancel, px(40.0)),
+            ]
+        };
+        let w = specs.iter().map(|(_, bw)| *bw).sum::<i32>() + pad * (specs.len() as i32 + 1);
 
         let left = (cx - w / 2).clamp(m.left + gap, (m.right - w - gap).max(m.left + gap));
         let below = r.bottom + gap;
@@ -476,13 +494,9 @@ impl Overlay {
         };
         let container = PixelRect { left, top, right: left + w, bottom: top + h };
         let mut x = left + pad;
-        let mut buttons = [(ToolbarButton::Copy, container); 3];
-        for (i, (kind, width)) in [ToolbarButton::Copy, ToolbarButton::Save, ToolbarButton::Cancel]
-            .into_iter()
-            .zip(widths)
-            .enumerate()
-        {
-            buttons[i] = (kind, PixelRect { left: x, top: top + pad, right: x + width, bottom: top + h - pad });
+        let mut buttons = Vec::with_capacity(specs.len());
+        for &(kind, width) in specs {
+            buttons.push((kind, PixelRect { left: x, top: top + pad, right: x + width, bottom: top + h - pad }));
             x += width + pad;
         }
         Some((si, container, buttons))
@@ -500,6 +514,8 @@ impl Overlay {
     fn after_delivery(&self) -> Delivery {
         match self.options.after {
             AfterCapture::Copy => Delivery::Copy,
+            AfterCapture::Edit if self.options.editor_installed => Delivery::Edit,
+            AfterCapture::Edit => Delivery::Copy,
             AfterCapture::CopyAndSave | AfterCapture::Ask => Delivery::CopyAndSave,
         }
     }
@@ -586,6 +602,7 @@ impl Overlay {
             }
             Phase::Selected { .. } => match self.toolbar_button_at_cursor() {
                 Some(ToolbarButton::Copy) => self.commit_current(Delivery::Copy),
+                Some(ToolbarButton::Edit) => self.commit_current(Delivery::Edit),
                 Some(ToolbarButton::Save) => self.commit_current(Delivery::Save),
                 Some(ToolbarButton::Cancel) => self.finish(OverlayResult::Cancelled),
                 None => {}
@@ -614,6 +631,10 @@ impl Overlay {
             v if v == VK_RETURN.0 => self.commit_current(Delivery::Copy),
             0x43 if ctrl => self.commit_current(Delivery::Copy), // Ctrl+C
             0x53 if ctrl => self.commit_current(Delivery::Save), // Ctrl+S
+            0x45 if self.options.purpose == Purpose::Screenshot && self.options.editor_installed => {
+                // E / Ctrl+E: open selection in Image Editor.
+                self.commit_current(Delivery::Edit);
+            }
             0x43 if self.options.purpose == Purpose::Screenshot => {
                 // C: copy the colour under the cursor.
                 let (x, y) = self.cursor;
@@ -693,7 +714,7 @@ impl Overlay {
         )?;
         let k = s.scale;
         let hint = f.text_format(13.0 * k, d2d::DWRITE_FONT_WEIGHT_NORMAL, d2d::DWRITE_PARAGRAPH_ALIGNMENT_CENTER, d2d::DWRITE_TEXT_ALIGNMENT_CENTER)?;
-        let hint_width = f.text_width(hint_text(self.options.mode, self.options.purpose), &hint);
+        let hint_width = f.text_width(hint_text(self.options.mode, self.options.purpose, self.options.editor_installed), &hint);
         let gfx = SurfaceGfx {
             hint_width,
             hint,
@@ -761,7 +782,7 @@ impl Overlay {
 
             if let Some(hl) = highlight {
                 let r = local(hl);
-                let stroke = (2.0 * k).round().max(1.0);
+                let stroke = (f32::from(self.options.border_width) * k).round().max(1.0);
                 let inset = stroke / 2.0;
                 t.DrawRectangle(&d2d::rect(r.left + inset, r.top + inset, r.right - inset, r.bottom - inset), &accent_brush, stroke, None);
 
@@ -827,6 +848,7 @@ impl Overlay {
                     }
                     let label = match kind {
                         ToolbarButton::Copy => "Copy",
+                        ToolbarButton::Edit => "Edit",
                         ToolbarButton::Save => "Save",
                         ToolbarButton::Cancel => "✕",
                     };
@@ -835,7 +857,7 @@ impl Overlay {
             }
 
             if self.phase == Phase::Hover && self.surface_at(self.cursor.0, self.cursor.1) == Some(index) {
-                let hint = hint_text(self.options.mode, self.options.purpose);
+                let hint = hint_text(self.options.mode, self.options.purpose, self.options.editor_installed);
                 let tw = g.hint_width + 36.0 * k;
                 let th = 38.0 * k;
                 let x = (w - tw) / 2.0;
@@ -942,14 +964,17 @@ impl Overlay {
     }
 }
 
-fn hint_text(mode: CaptureMode, purpose: Purpose) -> &'static str {
+fn hint_text(mode: CaptureMode, purpose: Purpose, editor_installed: bool) -> &'static str {
     if purpose == Purpose::Record {
         return "Drag an area or click a window to record   ·   F  Full screen   ·   Esc  Cancel";
     }
-    match mode {
-        CaptureMode::Region => "Drag to select   ·   Click a window   ·   F  Full screen   ·   Z  Magnifier   ·   C  Copy colour   ·   Esc  Cancel",
-        CaptureMode::Window => "Click a window to capture   ·   Z  Magnifier   ·   Esc  Cancel",
-        CaptureMode::Monitor => "Click a display to capture   ·   Esc  Cancel",
+    match (mode, editor_installed) {
+        (CaptureMode::Region, true) => "Drag to select   ·   Click a window   ·   E  Edit   ·   F  Full screen   ·   Z  Magnifier   ·   C  Copy colour   ·   Esc  Cancel",
+        (CaptureMode::Region, false) => "Drag to select   ·   Click a window   ·   F  Full screen   ·   Z  Magnifier   ·   C  Copy colour   ·   Esc  Cancel",
+        (CaptureMode::Window, true) => "Click a window to capture   ·   E  Edit   ·   Z  Magnifier   ·   Esc  Cancel",
+        (CaptureMode::Window, false) => "Click a window to capture   ·   Z  Magnifier   ·   Esc  Cancel",
+        (CaptureMode::Monitor, true) => "Click a display to capture   ·   E  Edit   ·   Esc  Cancel",
+        (CaptureMode::Monitor, false) => "Click a display to capture   ·   Esc  Cancel",
     }
 }
 

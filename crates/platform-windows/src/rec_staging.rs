@@ -73,6 +73,8 @@ pub struct StagingConfig {
     pub window: Option<isize>,
     pub window_title: Option<String>,
     pub highlight: [u8; 3],
+    /// Border thickness in pixels at 100% scale.
+    pub border_width: u8,
     pub dark: bool,
     pub desktop_audio: bool,
     pub microphone: bool,
@@ -201,6 +203,7 @@ struct Staging<'a> {
     window: Option<isize>,
     window_title: Option<String>,
     highlight: [u8; 3],
+    border_width: u8,
     dark: bool,
     desktop_audio: bool,
     microphone: bool,
@@ -253,6 +256,7 @@ pub fn run_staging(
         window: initial.window,
         window_title: initial.window_title,
         highlight: initial.highlight,
+        border_width: initial.border_width,
         dark: initial.dark,
         desktop_audio: initial.desktop_audio,
         microphone: initial.microphone,
@@ -770,7 +774,7 @@ impl Staging<'_> {
                 t.FillRectangle(&edge, &hit_brush);
             }
 
-            let stroke = (2.0 * k).round().max(2.0);
+            let stroke = (f32::from(self.border_width) * k).round().max(1.0);
             t.DrawRectangle(
                 &d2d::rect(rx - 1.0, ry - 1.0, rx + rw + 1.0, ry + rh + 1.0),
                 &shadow_brush,

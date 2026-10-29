@@ -254,7 +254,7 @@ impl StartJob {
             if self.cancel.load(Ordering::Acquire) {
                 return Err(String::new());
             }
-            let (rect, window, window_title) = match capture::select_area(c.magnifier, c.highlight)? {
+            let (rect, window, window_title) = match capture::select_area(c.magnifier, r.highlight, r.border_width)? {
                 capture::Selection::Cancelled => return Err(String::new()),
                 capture::Selection::Area { rect, window, window_title } => (rect, window, window_title),
             };
@@ -276,7 +276,8 @@ impl StartJob {
                         rect,
                         window,
                         window_title,
-                        highlight: c.highlight,
+                        highlight: r.highlight,
+                        border_width: r.border_width,
                         dark: self.dark,
                         desktop_audio,
                         microphone,
@@ -336,7 +337,7 @@ impl StartJob {
         let outline = {
             let handle = handle.clone();
             let visible = self.show_outline.clone();
-            match RecordingOutline::show(rect, window, c.highlight, move || {
+            match RecordingOutline::show(rect, window, r.highlight, r.border_width, move || {
                 let phase = match &*handle.lock().unwrap() {
                     None => OutlinePhase::Countdown,
                     Some(h) if h.is_paused() => OutlinePhase::Paused,

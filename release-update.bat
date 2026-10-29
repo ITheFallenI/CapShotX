@@ -8,7 +8,7 @@ echo ============================================================
 echo.
 echo This will:
 echo   1. Bump the version in Cargo.toml (+0.1)
-echo   2. Build release CapShotX.exe and CapShotX-Setup.exe
+echo   2. Build release CapShotX.exe, CapShotX_Editor.exe, and CapShotX-Setup.exe
 echo   3. Commit, push to GitHub, and publish a new GitHub Release
 echo.
 set "CONFIRM="

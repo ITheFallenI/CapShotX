@@ -13,6 +13,8 @@ use crate::settings::ThemeChoice;
 pub enum Action {
     #[serde(rename = "capture.region")]
     CaptureRegion,
+    #[serde(rename = "capture.edit")]
+    CaptureEdit,
     #[serde(rename = "capture.window")]
     CaptureWindow,
     #[serde(rename = "capture.monitor")]
@@ -30,6 +32,7 @@ pub enum Action {
 impl Action {
     pub const ALL: &[Action] = &[
         Action::CaptureRegion,
+        Action::CaptureEdit,
         Action::CaptureWindow,
         Action::CaptureMonitor,
         Action::RecordToggle,
@@ -48,6 +51,7 @@ impl Action {
             Action::RecordToggle => 5,
             Action::RecordFast => 6,
             Action::RecordPause => 7,
+            Action::CaptureEdit => 8,
         }
     }
 
@@ -58,6 +62,7 @@ impl Action {
     pub fn label(self) -> &'static str {
         match self {
             Action::CaptureRegion => "Capture region",
+            Action::CaptureEdit => "Capture & edit",
             Action::CaptureWindow => "Capture window",
             Action::CaptureMonitor => "Capture display",
             Action::RecordToggle => "Start / stop recording",
@@ -70,6 +75,7 @@ impl Action {
     pub fn description(self) -> &'static str {
         match self {
             Action::CaptureRegion => "Drag an area, or click a window or the desktop",
+            Action::CaptureEdit => "Capture an area or window and open it in the Image Editor",
             Action::CaptureWindow => "Click the window to capture",
             Action::CaptureMonitor => "Click the display to capture",
             Action::RecordToggle => "Pick bounds to record; press again to start (when staging) or stop",
@@ -83,6 +89,7 @@ impl Action {
     pub fn default_shortcut(self) -> &'static str {
         match self {
             Action::CaptureRegion => "Ctrl+Shift+2",
+            Action::CaptureEdit => "Ctrl+Shift+E",
             Action::CaptureWindow | Action::CaptureMonitor | Action::RecordFast | Action::RecordPause => "",
             Action::RecordToggle => "Ctrl+Shift+5",
             Action::OpenApp => "Ctrl+Shift+G",
@@ -96,6 +103,7 @@ impl Action {
 pub enum AppCommand {
     TrayLeftClick,
     Open,
+    OpenEditor,
     OpenSettings,
     Quit,
     Hotkey(Action),
@@ -123,6 +131,7 @@ pub enum AppCommand {
         manual: bool,
     },
     UpdateInstallFinished(Result<(), String>),
+    EditorInstallFinished(Result<String, String>),
 }
 
 /// Sends [`AppCommand`]s and wakes whichever loop is currently active on the

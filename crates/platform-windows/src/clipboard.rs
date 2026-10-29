@@ -1,11 +1,14 @@
-//! Clipboard image output.
+//! Clipboard image input and output.
 
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL};
 use windows::Win32::Graphics::Gdi::{BI_RGB, BITMAPINFOHEADER};
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+    CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+    RegisterClipboardFormatW, SetClipboardData,
 };
-use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+use windows::Win32::System::Memory::{
+    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
+};
 use windows::Win32::System::Ole::{CF_DIB, CF_UNICODETEXT};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE,
@@ -137,4 +140,149 @@ fn dib_bytes(width: u32, height: u32, bgra: &[u8]) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Image data read from the Windows clipboard.
+#[derive(Clone, Debug)]
+pub enum ClipboardImage {
+    /// Registered `"PNG"` clipboard format bytes.
+    Png(Vec<u8>),
+    /// Decoded top-down BGRA8 pixels from `CF_DIB`.
+    Bgra {
+        width: u32,
+        height: u32,
+        bgra: Vec<u8>,
+    },
+}
+
+/// Reads an image from the Windows clipboard (`PNG` format preferred, falling
+/// back to 24-bpp / 32-bpp `CF_DIB`).
+pub fn get_image() -> Option<ClipboardImage> {
+    unsafe {
+        let owner = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("STATIC"),
+            None,
+            WINDOW_STYLE(0),
+            0,
+            0,
+            0,
+            0,
+            Some(HWND_MESSAGE),
+            None,
+            None,
+            None,
+        )
+        .ok()?;
+        let out = (|| {
+            open_with_retry(owner).ok()?;
+            let res = read_clipboard_image();
+            let _ = CloseClipboard();
+            res
+        })();
+        let _ = DestroyWindow(owner);
+        out
+    }
+}
+
+unsafe fn read_clipboard_image() -> Option<ClipboardImage> {
+    unsafe {
+        let png_format = RegisterClipboardFormatW(w!("PNG"));
+        if png_format != 0 && IsClipboardFormatAvailable(png_format).is_ok() {
+            if let Some(bytes) = get_clipboard_bytes(png_format) {
+                if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+                    return Some(ClipboardImage::Png(bytes));
+                }
+            }
+        }
+        if IsClipboardFormatAvailable(CF_DIB.0 as u32).is_ok() {
+            if let Some(bytes) = get_clipboard_bytes(CF_DIB.0 as u32) {
+                if let Some((width, height, bgra)) = parse_dib_to_bgra(&bytes) {
+                    return Some(ClipboardImage::Bgra {
+                        width,
+                        height,
+                        bgra,
+                    });
+                }
+            }
+        }
+        None
+    }
+}
+
+unsafe fn get_clipboard_bytes(format: u32) -> Option<Vec<u8>> {
+    unsafe {
+        let handle = GetClipboardData(format).ok()?;
+        let mem = HGLOBAL(handle.0);
+        let size = GlobalSize(mem);
+        if size == 0 {
+            return None;
+        }
+        let ptr = GlobalLock(mem) as *const u8;
+        if ptr.is_null() {
+            return None;
+        }
+        let slice = std::slice::from_raw_parts(ptr, size);
+        let out = slice.to_vec();
+        let _ = GlobalUnlock(mem);
+        Some(out)
+    }
+}
+
+fn parse_dib_to_bgra(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    if bytes.len() < size_of::<BITMAPINFOHEADER>() {
+        return None;
+    }
+    let header: BITMAPINFOHEADER =
+        unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const BITMAPINFOHEADER) };
+    let header_size = header.biSize as usize;
+    if header_size < size_of::<BITMAPINFOHEADER>() || bytes.len() < header_size {
+        return None;
+    }
+    let width = header.biWidth.unsigned_abs();
+    let height = header.biHeight.unsigned_abs();
+    if width == 0 || height == 0 || width > 16384 || height > 16384 {
+        return None;
+    }
+    let top_down = header.biHeight < 0;
+    let bpp = header.biBitCount;
+    if bpp != 32 && bpp != 24 {
+        return None;
+    }
+    let extra_masks = if header.biCompression == 3 && header_size == size_of::<BITMAPINFOHEADER>() {
+        12
+    } else {
+        0
+    };
+    let pixel_offset = header_size + extra_masks;
+    if bytes.len() <= pixel_offset {
+        return None;
+    }
+    let pixels = &bytes[pixel_offset..];
+    let row_bytes = (width as usize * bpp as usize).div_ceil(32) * 4;
+    if pixels.len() < row_bytes * height as usize {
+        return None;
+    }
+
+    let mut bgra = vec![0u8; width as usize * height as usize * 4];
+    for y in 0..height as usize {
+        let src_y = if top_down {
+            y
+        } else {
+            height as usize - 1 - y
+        };
+        let src_row = &pixels[src_y * row_bytes..src_y * row_bytes + row_bytes];
+        let dst_row = &mut bgra[y * width as usize * 4..(y + 1) * width as usize * 4];
+        if bpp == 32 {
+            for (dst, src) in dst_row.chunks_exact_mut(4).zip(src_row.chunks_exact(4)) {
+                let a = if src[3] == 0 { 255 } else { src[3] };
+                dst.copy_from_slice(&[src[0], src[1], src[2], a]);
+            }
+        } else {
+            for (dst, src) in dst_row.chunks_exact_mut(4).zip(src_row.chunks_exact(3)) {
+                dst.copy_from_slice(&[src[0], src[1], src[2], 255]);
+            }
+        }
+    }
+    Some((width, height, bgra))
 }

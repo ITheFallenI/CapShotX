@@ -21,11 +21,12 @@ use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificL
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
+use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
     FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOS_FORCEFILESYSTEM,
-    FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog, IShellItem, SHCreateItemFromParsingName,
-    SHELLEXECUTEINFOW, SHFILEOPSTRUCTW, SHFileOperationW, SIGDN_FILESYSPATH, ShellExecuteExW,
-    ShellExecuteW,
+    FOS_OVERWRITEPROMPT, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, FileOpenDialog, FileSaveDialog,
+    IFileOpenDialog, IFileSaveDialog, IShellItem, SHCreateItemFromParsingName, SHELLEXECUTEINFOW,
+    SHFILEOPSTRUCTW, SHFileOperationW, SIGDN_FILESYSPATH, ShellExecuteExW, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetCursorPos, GetMessagePos, GetMessageW, MSG, PM_REMOVE, PeekMessageW,
@@ -131,6 +132,99 @@ pub fn pick_folder(initial: Option<&Path>) -> Option<PathBuf> {
             .SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM)
             .ok()?;
         if let Some(initial) = initial.filter(|p| p.is_dir()) {
+            let path = HSTRING::from(initial.as_os_str());
+            if let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(&path, None) {
+                let _ = dialog.SetFolder(&item);
+            }
+        }
+        dialog.Show(None).ok()?;
+        let item = dialog.GetResult().ok()?;
+        let name = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let path = name.to_string().ok();
+        CoTaskMemFree(Some(name.0 as *const _));
+        path.map(PathBuf::from)
+    }
+}
+
+/// Shows the standard Open file dialog filtered to image files (`*.png`,
+/// `*.jpg`, `*.jpeg`, `*.bmp`, `*.webp`).
+pub fn pick_open_image(initial: Option<&Path>) -> Option<PathBuf> {
+    unsafe {
+        let dialog: IFileOpenDialog =
+            CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let options = dialog.GetOptions().ok()?;
+        dialog
+            .SetOptions(options | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST)
+            .ok()?;
+        let filters = [
+            COMDLG_FILTERSPEC {
+                pszName: w!("Images (*.png;*.jpg;*.jpeg;*.bmp;*.webp)"),
+                pszSpec: w!("*.png;*.jpg;*.jpeg;*.bmp;*.webp"),
+            },
+            COMDLG_FILTERSPEC {
+                pszName: w!("All files (*.*)"),
+                pszSpec: w!("*.*"),
+            },
+        ];
+        let _ = dialog.SetFileTypes(&filters);
+        let _ = dialog.SetFileTypeIndex(1);
+        if let Some(initial) = initial.filter(|p| p.is_dir()) {
+            let path = HSTRING::from(initial.as_os_str());
+            if let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(&path, None) {
+                let _ = dialog.SetFolder(&item);
+            }
+        }
+        dialog.Show(None).ok()?;
+        let item = dialog.GetResult().ok()?;
+        let name = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let path = name.to_string().ok();
+        CoTaskMemFree(Some(name.0 as *const _));
+        path.map(PathBuf::from)
+    }
+}
+
+/// Shows the standard Save As dialog for an image (`PNG` or `JPG`).
+pub fn pick_save_image(
+    initial_dir: Option<&Path>,
+    default_name: &str,
+    is_jpg: bool,
+) -> Option<PathBuf> {
+    unsafe {
+        let dialog: IFileSaveDialog =
+            CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let options = dialog.GetOptions().ok()?;
+        dialog
+            .SetOptions(options | FOS_FORCEFILESYSTEM | FOS_OVERWRITEPROMPT | FOS_PATHMUSTEXIST)
+            .ok()?;
+        let filters = if is_jpg {
+            [
+                COMDLG_FILTERSPEC {
+                    pszName: w!("JPEG image (*.jpg)"),
+                    pszSpec: w!("*.jpg;*.jpeg"),
+                },
+                COMDLG_FILTERSPEC {
+                    pszName: w!("PNG image (*.png)"),
+                    pszSpec: w!("*.png"),
+                },
+            ]
+        } else {
+            [
+                COMDLG_FILTERSPEC {
+                    pszName: w!("PNG image (*.png)"),
+                    pszSpec: w!("*.png"),
+                },
+                COMDLG_FILTERSPEC {
+                    pszName: w!("JPEG image (*.jpg)"),
+                    pszSpec: w!("*.jpg;*.jpeg"),
+                },
+            ]
+        };
+        let _ = dialog.SetFileTypes(&filters);
+        let _ = dialog.SetFileTypeIndex(1);
+        let _ = dialog.SetDefaultExtension(if is_jpg { w!("jpg") } else { w!("png") });
+        let fname = HSTRING::from(default_name);
+        let _ = dialog.SetFileName(&fname);
+        if let Some(initial) = initial_dir.filter(|p| p.is_dir()) {
             let path = HSTRING::from(initial.as_os_str());
             if let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(&path, None) {
                 let _ = dialog.SetFolder(&item);

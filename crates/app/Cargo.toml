@@ -8,12 +8,17 @@ license.workspace = true
 name = "CapShotX"
 path = "src/main.rs"
 
+[[bin]]
+name = "CapShotX_Editor"
+path = "src/editor_main.rs"
+
 [dependencies]
 capture = { path = "../capture" }
 gallery = { path = "../gallery" }
 media = { path = "../media" }
 recorder = { path = "../recorder" }
 platform-windows = { path = "../platform-windows" }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "webp"] }
 eframe.workspace = true
 egui.workspace = true
 tray-icon.workspace = true

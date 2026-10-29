@@ -42,37 +42,45 @@ try {
     }
 
     $defaultExe = Join-Path $RepoRoot "target\release\CapShotX.exe"
+    $defaultEditorExe = Join-Path $RepoRoot "target\release\CapShotX_Editor.exe"
     $useStageDir = $false
 
-    if (Test-Path $defaultExe) {
-        try {
-            $stream = [System.IO.File]::Open(
-                $defaultExe,
-                [System.IO.FileMode]::Open,
-                [System.IO.FileAccess]::ReadWrite,
-                [System.IO.FileShare]::None
-            )
-            $stream.Close()
-        } catch {
-            $useStageDir = $true
+    foreach ($candidate in @($defaultExe, $defaultEditorExe)) {
+        if (Test-Path $candidate) {
+            try {
+                $stream = [System.IO.File]::Open(
+                    $candidate,
+                    [System.IO.FileMode]::Open,
+                    [System.IO.FileAccess]::ReadWrite,
+                    [System.IO.FileShare]::None
+                )
+                $stream.Close()
+            } catch {
+                $useStageDir = $true
+            }
         }
     }
 
     if ($useStageDir) {
         $stageTarget = Join-Path $RepoRoot "target\installer-stage"
-        Write-Host "[1/3] target\release\CapShotX.exe is currently running; building fresh payload in target\installer-stage..." -ForegroundColor Cyan
+        Write-Host "[1/3] target\release binary is currently running; building fresh payloads in target\installer-stage..." -ForegroundColor Cyan
         & cargo build --release -p capshotx --target-dir $stageTarget @cargoFlags
-        if ($LASTEXITCODE -ne 0) { throw "Failed to build CapShotX payload." }
+        if ($LASTEXITCODE -ne 0) { throw "Failed to build CapShotX payloads." }
         $payloadExe = Join-Path $stageTarget "release\CapShotX.exe"
+        $editorExe = Join-Path $stageTarget "release\CapShotX_Editor.exe"
     } else {
-        Write-Host "[1/3] Building release CapShotX.exe payload..." -ForegroundColor Cyan
+        Write-Host "[1/3] Building release CapShotX.exe and CapShotX_Editor.exe..." -ForegroundColor Cyan
         & cargo build --release -p capshotx @cargoFlags
-        if ($LASTEXITCODE -ne 0) { throw "Failed to build CapShotX payload." }
+        if ($LASTEXITCODE -ne 0) { throw "Failed to build CapShotX payloads." }
         $payloadExe = $defaultExe
+        $editorExe = $defaultEditorExe
     }
 
     if (-not (Test-Path $payloadExe)) {
         throw "Expected payload not found at $payloadExe"
+    }
+    if (-not (Test-Path $editorExe)) {
+        throw "Expected editor binary not found at $editorExe"
     }
 
     Write-Host "[2/3] Embedding compressed payload and building CapShotX-Setup.exe..." -ForegroundColor Cyan
@@ -86,15 +94,19 @@ try {
 
     $distSetup = Join-Path $distDir "CapShotX-Setup.exe"
     $distPortable = Join-Path $distDir "CapShotX.exe"
+    $distEditor = Join-Path $distDir "CapShotX_Editor.exe"
     Copy-Item -Force $builtSetup $distSetup
     Copy-Item -Force $payloadExe $distPortable
+    Copy-Item -Force $editorExe $distEditor
 
     $setupMb = [math]::Round((Get-Item $distSetup).Length / 1MB, 2)
     $appMb = [math]::Round((Get-Item $distPortable).Length / 1MB, 2)
+    $editorMb = [math]::Round((Get-Item $distEditor).Length / 1MB, 2)
 
     Write-Host "[3/3] Packaging complete!" -ForegroundColor Green
     Write-Host "  Installer : $distSetup ($setupMb MB)"
     Write-Host "  Portable  : $distPortable ($appMb MB)"
+    Write-Host "  Editor    : $distEditor ($editorMb MB - optional add-on)"
     $buildSucceeded = $true
 
     $cargoToml = Get-Content $cargoTomlPath -Raw
@@ -124,6 +136,7 @@ try {
     if ($PublishRelease) {
         $setupAsset = "$distSetup#CapShotX-Setup.exe (Windows Installer)"
         $portableAsset = "$distPortable#CapShotX.exe (Portable)"
+        $editorAsset = "$distEditor#CapShotX_Editor.exe (Optional Image Editor)"
 
         Write-Host "Publishing $tag to GitHub Releases..." -ForegroundColor Cyan
         $prevEap = $ErrorActionPreference
@@ -132,14 +145,14 @@ try {
         $releaseExists = ($LASTEXITCODE -eq 0)
 
         if ($releaseExists) {
-            & gh release upload $tag $setupAsset $portableAsset --clobber
+            & gh release upload $tag $setupAsset $portableAsset $editorAsset --clobber
             if ($LASTEXITCODE -ne 0) { $ErrorActionPreference = $prevEap; throw "Failed to upload release assets to $tag" }
             Write-Host "Updated assets on existing release $tag!" -ForegroundColor Green
         } else {
             if ([string]::IsNullOrWhiteSpace($ReleaseNotes)) {
-                & gh release create $tag $setupAsset $portableAsset --title "CapShotX $tag" --generate-notes
+                & gh release create $tag $setupAsset $portableAsset $editorAsset --title "CapShotX $tag" --generate-notes
             } else {
-                & gh release create $tag $setupAsset $portableAsset --title "CapShotX $tag" --notes $ReleaseNotes
+                & gh release create $tag $setupAsset $portableAsset $editorAsset --title "CapShotX $tag" --notes $ReleaseNotes
             }
             if ($LASTEXITCODE -ne 0) { $ErrorActionPreference = $prevEap; throw "Failed to create GitHub release $tag" }
             Write-Host "Published new GitHub release $tag!" -ForegroundColor Green

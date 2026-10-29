@@ -8,7 +8,9 @@ use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIc
 use crate::commands::{Action, AppCommand, Waker};
 
 const MENU_OPEN: &str = "open";
+const MENU_EDITOR: &str = "editor";
 const MENU_CAPTURE_REGION: &str = "capture_region";
+const MENU_CAPTURE_EDIT: &str = "capture_edit";
 const MENU_CAPTURE_WINDOW: &str = "capture_window";
 const MENU_CAPTURE_MONITOR: &str = "capture_monitor";
 const MENU_SETTINGS: &str = "settings";
@@ -93,14 +95,21 @@ pub fn install(waker: Waker) -> anyhow::Result<Tray> {
 
 fn show_menu(waker: &Waker) {
     let is_recording = RECORDING.load(Ordering::Relaxed);
-    let mut entries = vec![
-        MenuEntry::item(MENU_OPEN, "Open CapShotX"),
-        MenuEntry::Separator,
-        MenuEntry::item(MENU_CAPTURE_REGION, "Capture region"),
+    let editor_installed = crate::editor_addon::is_installed();
+    let mut entries = vec![MenuEntry::item(MENU_OPEN, "Open CapShotX")];
+    if editor_installed {
+        entries.push(MenuEntry::item(MENU_EDITOR, "Open Image Editor"));
+    }
+    entries.push(MenuEntry::Separator);
+    entries.push(MenuEntry::item(MENU_CAPTURE_REGION, "Capture region"));
+    if editor_installed {
+        entries.push(MenuEntry::item(MENU_CAPTURE_EDIT, "Capture & edit"));
+    }
+    entries.extend([
         MenuEntry::item(MENU_CAPTURE_WINDOW, "Capture window"),
         MenuEntry::item(MENU_CAPTURE_MONITOR, "Capture display"),
         MenuEntry::Separator,
-    ];
+    ]);
     if is_recording {
         entries.push(MenuEntry::item(MENU_RECORD, "Stop recording"));
     } else {
@@ -120,8 +129,13 @@ fn show_menu(waker: &Waker) {
 
     let waker = waker.clone();
     let on_select = move |id: &str| {
+        if id == MENU_EDITOR {
+            waker.send(AppCommand::OpenEditor);
+            return;
+        }
         if let Some(action) = match id {
             MENU_CAPTURE_REGION => Some(Action::CaptureRegion),
+            MENU_CAPTURE_EDIT => Some(Action::CaptureEdit),
             MENU_CAPTURE_WINDOW => Some(Action::CaptureWindow),
             MENU_CAPTURE_MONITOR => Some(Action::CaptureMonitor),
             _ => None,
@@ -149,7 +163,7 @@ fn show_menu(waker: &Waker) {
     let result = if use_native {
         let mut opened_ui = false;
         let res = show_native_popup_menu(entries, theme, |id| {
-            opened_ui = matches!(id, MENU_OPEN | MENU_SETTINGS);
+            opened_ui = matches!(id, MENU_OPEN | MENU_SETTINGS | MENU_EDITOR);
             on_select(id);
         });
         if !opened_ui && !RECORDING.load(Ordering::Relaxed) {

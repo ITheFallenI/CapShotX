@@ -99,6 +99,7 @@ enum Job {
 /// What a tile click asks the page to do.
 enum TileAction {
     Preview(PathBuf),
+    Edit(PathBuf),
     Rename(PathBuf),
     Delete(PathBuf),
 }
@@ -299,11 +300,11 @@ impl GalleryView {
 
     // ----- Gallery page ----------------------------------------------------
 
-    pub fn page_ui(&mut self, ui: &mut Ui) {
+    pub fn page_ui(&mut self, ui: &mut Ui) -> Option<PathBuf> {
         if self.preview.is_some() {
-            self.preview_ui(ui);
+            let edit_path = self.preview_ui(ui);
             self.rename_dialog(ui.ctx());
-            return;
+            return edit_path;
         }
         let p = palette(ui);
 
@@ -362,7 +363,7 @@ impl GalleryView {
                 self.empty_state(ui, "No matches", "Try changing the media filter or file-name search.");
             }
             self.notice_ui(ui);
-            return;
+            return None;
         }
 
         // Rows: a header per day, then tile rows. Laid out up front so only
@@ -434,11 +435,13 @@ impl GalleryView {
             }
         });
         self.finish_frame();
+        let mut edit_out = None;
         if let Some(action) = action {
-            self.apply(action);
+            edit_out = self.apply(action);
         }
         self.notice_ui(ui);
         self.rename_dialog(ui.ctx());
+        edit_out
     }
 
     /// Drops queued thumbnail work for tiles that scrolled out of view.
@@ -448,14 +451,22 @@ impl GalleryView {
         self.thumbs.retain(|k, s| !matches!(s, Slot::Pending) || wanted.contains(k));
     }
 
-    fn apply(&mut self, action: TileAction) {
+    fn apply(&mut self, action: TileAction) -> Option<PathBuf> {
         match action {
-            TileAction::Preview(path) => self.open_preview(path),
+            TileAction::Preview(path) => {
+                self.open_preview(path);
+                None
+            }
+            TileAction::Edit(path) => Some(path),
             TileAction::Rename(path) => {
                 let text = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
                 self.rename = Some(Rename { path, text, error: None, focus: true });
+                None
             }
-            TileAction::Delete(path) => self.delete(&path),
+            TileAction::Delete(path) => {
+                self.delete(&path);
+                None
+            }
         }
     }
 
@@ -582,6 +593,11 @@ impl GalleryView {
     fn item_menu(&mut self, ui: &mut Ui, path: &Path) -> Option<TileAction> {
         let mut action = None;
         let video = gallery::is_video(path);
+        let editor_installed = crate::editor_addon::is_installed();
+        if !video && editor_installed && ui.button("Edit in CapShotX Editor").clicked() {
+            action = Some(TileAction::Edit(path.to_path_buf()));
+            ui.close();
+        }
         if ui.button(if video { "Play" } else { "Open" }).clicked() {
             shell::open(path);
             ui.close();
@@ -638,9 +654,9 @@ impl GalleryView {
         order.get((pos + step) as usize).filter(|_| pos + step >= 0).map(|e| e.path.clone())
     }
 
-    fn preview_ui(&mut self, ui: &mut Ui) {
+    fn preview_ui(&mut self, ui: &mut Ui) -> Option<PathBuf> {
         let p = palette(ui);
-        let Some(preview) = &self.preview else { return };
+        let Some(preview) = &self.preview else { return None };
         let path = preview.path.clone();
         let video = gallery::is_video(&path);
         let entry = self.entries.iter().find(|e| e.path == path).cloned();
@@ -679,6 +695,9 @@ impl GalleryView {
                 }
                 if !video && ui.button("Copy image").clicked() {
                     self.copy_image(path.clone());
+                }
+                if !video && crate::editor_addon::is_installed() && ui.button("✏ Edit").clicked() {
+                    action = Some(TileAction::Edit(path.clone()));
                 }
                 if ui.button(if video { "▶ Play" } else { "Open" }).clicked() {
                     shell::open(&path);
@@ -767,10 +786,12 @@ impl GalleryView {
         } else if let Some(target) = go {
             self.open_preview(target);
         }
+        let mut edit_out = None;
         if let Some(a) = action {
-            self.apply(a);
+            edit_out = self.apply(a);
         }
         self.notice_ui(ui);
+        edit_out
     }
 
     // ----- Shared bits -----------------------------------------------------

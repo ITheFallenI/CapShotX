@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/app", "crates/capture", "crates/gallery", "crates/installer", "crates/media", "crates/platform-windows", "crates/recorder"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 

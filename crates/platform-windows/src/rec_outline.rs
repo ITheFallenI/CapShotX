@@ -73,13 +73,14 @@ impl RecordingOutline {
         rect: PixelRect,
         window: Option<isize>,
         highlight: [u8; 3],
+        border_width: u8,
         status: impl Fn() -> OutlineStatus + Send + 'static,
     ) -> Result<Self> {
         let (tx, rx) = mpsc::channel();
         let status: StatusFn = Box::new(status);
         let thread = std::thread::Builder::new()
             .name("rec-outline".into())
-            .spawn(move || run(rect, window, highlight, status, tx))
+            .spawn(move || run(rect, window, highlight, border_width, status, tx))
             .map_err(|_| windows::core::Error::from_thread())?;
         match rx.recv() {
             Ok(Ok((hwnd, excluded))) => Ok(Self { hwnd, excluded, thread: Some(thread) }),
@@ -170,6 +171,7 @@ struct State {
     rect: PixelRect,
     window: Option<isize>,
     highlight: [u8; 3],
+    border_width: u8,
     excluded: bool,
     status_fn: StatusFn,
     shown: bool,
@@ -180,6 +182,7 @@ fn run(
     rect: PixelRect,
     window: Option<isize>,
     highlight: [u8; 3],
+    border_width: u8,
     status_fn: StatusFn,
     ready: mpsc::Sender<Result<(isize, bool)>>,
 ) {
@@ -224,6 +227,7 @@ fn run(
                 rect,
                 window,
                 highlight,
+                border_width,
                 excluded,
                 status_fn,
                 shown: false,
@@ -334,7 +338,7 @@ impl State {
             Some(m) => (m.scale(), Some(m.bounds)),
             None => (1.0, None),
         };
-        let stroke = (2.0 * k).round().max(2.0);
+        let stroke = (f32::from(self.border_width) * k).round().max(1.0);
         let half = stroke / 2.0;
         let thick = (stroke * 0.5).max(1.0);
         let gap = 1.0;
@@ -534,7 +538,7 @@ mod tests {
         let phase = Arc::new(AtomicU8::new(0));
         let (v2, p2) = (visible.clone(), phase.clone());
 
-        let outline = RecordingOutline::show(rect, None, [110, 123, 255], move || {
+        let outline = RecordingOutline::show(rect, None, [110, 123, 255], 2, move || {
             let ph = match p2.load(Ordering::Acquire) {
                 0 => OutlinePhase::Countdown,
                 1 => OutlinePhase::Recording,

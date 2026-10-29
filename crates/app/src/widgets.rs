@@ -171,8 +171,6 @@ pub fn shortcut(ui: &mut Ui, keys: &[&str]) {
     let p = palette(ui);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
-        // Inside right-aligned rows `horizontal` lays out right-to-left;
-        // reverse so the chips still read Ctrl, Shift, key.
         let rtl = ui.layout().main_dir() == egui::Direction::RightToLeft;
         let ordered: Vec<&&str> = if rtl { keys.iter().rev().collect() } else { keys.iter().collect() };
         for key in ordered {
@@ -218,11 +216,13 @@ pub fn badge(ui: &mut Ui, text: &str, color: Color32, fill: Color32) {
 #[derive(Clone, Copy)]
 pub enum Icon {
     Home,
+    Addons,
     Settings,
     Region,
     Window,
     Monitor,
     Image,
+    Edit,
     Record,
 }
 
@@ -242,6 +242,23 @@ impl Icon {
                     vec![at(0.22, 0.4), at(0.22, 0.86), at(0.78, 0.86), at(0.78, 0.4)],
                     stroke,
                 ));
+            }
+            Icon::Addons => {
+                let r = s * 0.06;
+                for (x0, y0, x1, y1) in [
+                    (0.12, 0.12, 0.44, 0.44),
+                    (0.12, 0.56, 0.44, 0.88),
+                    (0.56, 0.56, 0.88, 0.88),
+                ] {
+                    painter.rect_stroke(
+                        Rect::from_min_max(at(x0, y0), at(x1, y1)),
+                        r,
+                        stroke,
+                        StrokeKind::Middle,
+                    );
+                }
+                painter.line_segment([at(0.56, 0.28), at(0.88, 0.28)], stroke);
+                painter.line_segment([at(0.72, 0.12), at(0.72, 0.44)], stroke);
             }
             Icon::Settings => {
                 let c = rect.center();
@@ -288,8 +305,14 @@ impl Icon {
                     stroke,
                 ));
             }
+            Icon::Edit => {
+                painter.add(Shape::closed_line(
+                    vec![at(0.16, 0.84), at(0.22, 0.60), at(0.68, 0.14), at(0.86, 0.32), at(0.40, 0.78)],
+                    stroke,
+                ));
+                painter.line_segment([at(0.58, 0.24), at(0.76, 0.42)], stroke);
+            }
             Icon::Record => {
-                // Video camera: body plus lens wedge, with a filled record dot.
                 let body = Rect::from_min_max(at(0.08, 0.26), at(0.66, 0.74));
                 painter.rect_stroke(body, s * 0.1, stroke, StrokeKind::Middle);
                 painter.add(Shape::closed_line(vec![at(0.7, 0.42), at(0.92, 0.3), at(0.92, 0.7), at(0.7, 0.58)], stroke));
